@@ -124,7 +124,12 @@ res = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=Tr
 print(res[0])
 ```
 
-
+We also provide a script for LLaDA generation for different variants of dKV-Cache (only support batch-size = 1 now). The command would be:
+```
+CUDA_VISIBLE_DEVICES=0 python llada_generate.py --origin
+CUDA_VISIBLE_DEVICES=0 python llada_generate.py --decode --cache-steps 8
+CUDA_VISIBLE_DEVICES=0 python llada_generate.py --greedy --sampling-alg random --cache-steps 2 --window-size 4
+```
 
 ### Result
 We test our methods on LLaDA-8B-Instruct and Dream-Base-7B on the benchmark. Here are the results for the algorithm.
