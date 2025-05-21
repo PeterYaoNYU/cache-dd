@@ -89,7 +89,6 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         
-        start_time = time.time()
         for i in range(steps):
             mask_index = (x == mask_id)
             if cfg_scale > 0.:
@@ -105,9 +104,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                     model.set_qkv_cache(True, True)
 
                     model.get_pos_rotary_embedding_cache(~prv_transfer_idx)
-                    #print(prv_transfer_idx[0], torch.nonzero(prv_transfer_idx, as_tuple=True)[1])
                     next_x = x[~prv_transfer_idx].view(x.shape[0], -1)
-                    #print("Input shape:", next_x.shape)
                     outputs = model(next_x, 
                         past_query_key_values = past_qkv, 
                         use_cache = True, preprocess_cache=True
@@ -145,32 +142,25 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
             if x0_p.shape[1] < x.shape[1]: # for cache
-                #print(x0_p, x0_p.shape)
                 # Refill x0_p with the -np.inf
-                #print(x0_p)
                 refill_x0_p = torch.full((x.shape[0], x.shape[1]), -np.inf, device=x0_p.device, dtype=x0_p.dtype)
                 reorder_token_idx = torch.nonzero(~prv_transfer_idx, as_tuple=True)[1].view(x0_p.shape[0], -1)
                 refill_x0_p = refill_x0_p.scatter_(1, reorder_token_idx, x0_p)
-                #print(refill_x0_p)
                 
                 x0_p = refill_x0_p
                 x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
                 # Refill x0 with mask_id
-                #print(x0)
                 refill_x0 = torch.full((x.shape[0], x.shape[1]), mask_id, device=x0.device, dtype=x0.dtype)
                 refill_x0 = refill_x0.scatter_(1, reorder_token_idx, x0)
                 x0 = refill_x0
-                #print(refill_x0)
                 
             x0 = torch.where(mask_index, x0, x)
-            #print(x0)
             confidence = torch.where(mask_index, x0_p, -np.inf)
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             for j in range(confidence.shape[0]):
                 _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                #print(select_index)
                 transfer_index[j, select_index] = True
             
             x[transfer_index] = x0[transfer_index] 
@@ -183,8 +173,6 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             prv_transfer_idx, cur_transfer_index = cur_transfer_index, all_transfer_index
             past_qkv = [past_qkv, (prv_transfer_idx, cur_transfer_index)]
 
-            #print("Step {}: Time = {}".format(i, time.time() - start_time))
-            start_time = time.time()
             #print(x[:, prompt.shape[1]:]) # For Debug
             #for b in range(B):
 

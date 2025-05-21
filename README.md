@@ -24,8 +24,7 @@ Please install `transformers==4.46.3` first.
 
 * For generation on Dream:
 
-```
-
+```python
 import torch
 - from transformers import AutoModel, AutoTokenizer
 + from models.modeling_dream import DreamModel
@@ -70,16 +69,74 @@ print(generations[0].split(tokenizer.eos_token)[0])
 
 ```
 
-Since we find that with `batch_size=1`, the inference acceleration is not obvious, we also provide a script for inference with large batch size:
+Since we observe that inference acceleration is not significant with batch_size=1 (and can sometimes be slower), we provide a script for inference with larger batch sizes:
 ```
 CUDA_VISIBLE_DEVICES=0 python dream_generate.py --decode --cache-steps 4
 ```
 
+Arguments for `dream_generate.py`:
+- `--seq-len`, `--steps`, `--sampling-alg`: The inference configuration for diffusion generation
+- `--prefill`: Enable `dkv-cache-prefill`. 
+- `--decode`: Enable `dkv-cache-decode`. Need to pass the cache steps in `--cache-steps`.
+- `--pd`: Enable `dkv-cache-pd`. Need to pass the cache steps in `--cache-steps`.
+- `--cache-steps`: The interval for cache refresh, e.g., 4 is to refresh the cache every 4 steps.
+
 * For generation on LLaDA:
+```python
+import torch
+- from transformers import AutoModel, AutoTokenizer
++ from models.modeling_llada_dkv_cache_decode import LLaDAModelLM
++ from generation_utils.llada_dkv_cache_decode import generate
++ from transformers import AutoTokenizer
+
+model = LLaDAModelLM.from_pretrained(
+    'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16,
+    device_map="auto"
+).eval()
+tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+
+prompt = [
+    "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
+] 
+
+m = [[{"role": "user", "content": "Please answer the question step by step and put the answer in \\boxed{}." + p}] for p in prompt]
+prompt = tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+bsz = len(prompt)
+
+input_ids = tokenizer(
+    prompt,
+    padding_side = 'left',
+    padding = 'longest'
+)['input_ids'] 
+input_ids = torch.tensor(input_ids).to("cuda")
+   
+
+out = generate(
+    model, tokenizer, input_ids, 
+    steps=128, gen_length=128, block_length=64, 
+    temperature=0., cfg_scale=0., 
+    remasking='low_confidence',
+    enable_cache=True,
+    cache_reloading_step=8,
+)
+
+res = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
+print(res[0])
+```
+
 
 
 ### Result
 We test our methods on LLaDA-8B-Instruct and Dream-Base-7B on the benchmark. Here are the results for the algorithm.
 ![alt text](assets/image.png)
+
+<div align="center">
+  <img src="assets/image.png" width="80%" ></img>
+  <br>
+  <em>
+      The evaluation results of dKV-Cache
+  </em>
+</div>
+<br>
 
 
