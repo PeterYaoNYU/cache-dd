@@ -82,6 +82,8 @@ Arguments for `dream_generate.py`:
 - `--pd`: Enable `dkv-cache-pd`. Need to pass the cache steps in `--cache-steps`.
 - `--cache-steps`: The interval for cache refresh, e.g., 4 is to refresh the cache every 4 steps.
 
+---
+
 * For generation on LLaDA:
 ```python
 import torch
