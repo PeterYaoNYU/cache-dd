@@ -128,7 +128,6 @@ print(res[0])
 
 ### Result
 We test our methods on LLaDA-8B-Instruct and Dream-Base-7B on the benchmark. Here are the results for the algorithm.
-![alt text](assets/image.png)
 
 <div align="center">
   <img src="assets/image.png" width="80%" ></img>
