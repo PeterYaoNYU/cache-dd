@@ -13,11 +13,12 @@
 > [xML Lab](https://sites.google.com/view/xml-nus), National University of Singapore
 
 ### Introduction
-We propose dKV-Cache, a special KV-Cache for Diffusion Language Models.
-
-* dKV-Cache based on the core idea that we need to delay the cache of key and values, compared to ARs.
-* We have different variants for dKV-Cache: dKV-Cache-Decode for high-performance, and dKV-Cache-Greedy for potential faster speed but with performance degradation.
-* dKV-Cache accelerate LLaDA and Dream. Based on the prefill length and the decoding length, the acceleration would range from 2$\times$ to 10$\times$ compared to the original implementation.
+We introduce dKV-Cache, a specialized KV-Cache for Diffusion Language Models:
+* Delayed Caching Mechanism: Unlike autoregressive models, dKV-Cache delays the caching of keys and values.
+* Two Variants:
+	(1) dKV-Cache-Decode for high-performance inference.
+	(2) dKV-Cache-Greedy for potentially faster decoding with some trade-off in performance.
+* Speed Acceleration: Applied to LLaDA and Dream, dKV-Cache achieves 2× to 10× speedups over the original implementation, depending on the prefill and decoding lengths.
 
 ### Usage
 Please install `transformers==4.46.3` first. 
