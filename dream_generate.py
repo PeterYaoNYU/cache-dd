@@ -104,7 +104,7 @@ if __name__ == "__main__":
         use_cache=args.decode or args.prefill or args.pd,
         cache_type="decoded" if args.decode else "prefill" if args.prefill else "pd",
         cache_steps=args.cache_steps,
-        shift_type="left"
+        shift_type="un"
     )
     
     for b in range(len(messages)):

@@ -564,14 +564,16 @@ class DreamGenerationMixin:
                 elif generation_config.cache_type == "decoded":
                     prv_cache_position = cache_position
                     #print(generation_config.cache_type, generation_config.shift_type, generation_config.cache_steps)
-                    if generation_config.shift_type == "left":
+                    if generation_config.shift_type == "un":
                         cache_position = (x != mask_token_id)
                         cache_position = torch.cat([cache_position[:, 1:], cache_position[:, :1]], dim=-1)
-                    elif generation_config.shift_type == "left_right":
+                    elif generation_config.shift_type == "un_right":
                         cache_position = (x[:, :-1] != mask_token_id) & (x[:, 1:] != mask_token_id)
                         cache_position = torch.cat([cache_position, cache_position[:, -1:]], dim=-1)
                     elif generation_config.shift_type == "right":
                         cache_position = (x != mask_token_id)
+                    else:
+                        raise NotImplementedError
                 else:
                     raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
 
