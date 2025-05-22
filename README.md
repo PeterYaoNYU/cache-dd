@@ -8,7 +8,7 @@
 </div>
 <br>
 
-> **dKV-Cache: The Cache for Diffusion Language Models**   🥯[[Arxiv]]()    
+> **dKV-Cache: The Cache for Diffusion Language Models**   🥯[[Arxiv]](http://arxiv.org/abs/2505.15781)    
 > [Xinyin Ma](https://horseee.github.io/), [Runpeng Yu](https://yu-rp.github.io/), [Gongfan Fang](https://fangggf.github.io/), [Xinchao Wang](https://sites.google.com/site/sitexinchaowang/)   
 > [xML Lab](https://sites.google.com/view/xml-nus), National University of Singapore
 
