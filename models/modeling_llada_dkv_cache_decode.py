@@ -369,27 +369,32 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, config: ModelConfig, cache: BufferCache, pos_cache: BufferCache):
         super().__init__()
         self.config = config
+        # this is rather static
         self.__cache = cache
+        # this change with transfer index. 
         self.__pos_cache = pos_cache
         # Warm up cache.
         self.rope_theta = config.rope_theta
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
 
-    def get_pos_rotary_embedding_cache(self, transfer_idx): # need prv_transfer_idx
+    def get_pos_rotary_embedding_cache(self, transfer_idx): # transfer idx is actually ~prv_transfer_idx, previously masked tokens.
         pos_sin = self.__cache.get("rope_pos_sin")
         pos_cos = self.__cache.get("rope_pos_cos")
 
         B, L = transfer_idx.shape
-        _, H, _, D = pos_sin.shape
+        _, H, _, D = pos_sin.shape # H = n_heads, D = d_model // n_heads (dimension per head. )
         #q_pos = torch.nonzero(~transfer_idx, as_tuple=True)[1].view(B, 1, -1, 1) # B, 1, num_masked, 1
         transfer_idx = transfer_idx.view(B, 1, -1, 1)
         transfer_idx = transfer_idx.expand(B, H, transfer_idx.shape[-2], D)
        
-        pos_sin = pos_sin[:, :, :L, :].repeat(B, 1, 1, 1)
+        pos_sin = pos_sin[:, :, :L, :].repeat(B, 1, 1, 1) # expand from (1, H, L, D) to (B, H, L, D) 
         pos_cos = pos_cos[:, :, :L, :].repeat(B, 1, 1, 1)
+        
+        # here transfer_idx refers to ~prv_transfer_idx, which is the tokens still masked in the previous timestep. 
         self.__pos_cache["rope_pos_sin_pos_cache"] = pos_sin[transfer_idx].view(B, H, -1, D)
         self.__pos_cache["rope_pos_cos_pos_cache"] = pos_cos[transfer_idx].view(B, H, -1, D)
 
+        # this is the tokens already unmasked in the last round. 
         self.__pos_cache["rope_pos_sin_pos_cache_transferred"] = pos_sin[~transfer_idx].view(B, H, -1, D)
         self.__pos_cache["rope_pos_cos_pos_cache_transferred"] = pos_cos[~transfer_idx].view(B, H, -1, D)
 
@@ -400,6 +405,7 @@ class RotaryEmbedding(nn.Module):
         self.__pos_cache["rope_pos_sin_pos_cache_transferred"] = None
         self.__pos_cache["rope_pos_cos_pos_cache_transferred"] = None
 
+    # this function is for static cache geenration. 
     def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
             (pos_sin := self.__cache.get("rope_pos_sin")) is not None
@@ -427,6 +433,7 @@ class RotaryEmbedding(nn.Module):
         self.__cache["rope_pos_cos"] = pos_cos
         return pos_sin, pos_cos
 
+    # this returns the still masked. 
     def get_pos_rotary_embedding(self, seq_len:int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         pos_sin = self.__pos_cache.get("rope_pos_sin_pos_cache")
         pos_cos = self.__pos_cache.get("rope_pos_cos_pos_cache")
@@ -435,6 +442,7 @@ class RotaryEmbedding(nn.Module):
 
         return pos_sin, pos_cos
 
+    # this returns a concatenated reordered version of the complete sequence, masked or unmasked. 
     def get_k_pos_rotary_embedding(self, seq_len:int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         pos_sin_masked = self.__pos_cache.get("rope_pos_sin_pos_cache")
         pos_cos_masked = self.__pos_cache.get("rope_pos_cos_pos_cache")
@@ -461,9 +469,9 @@ class RotaryEmbedding(nn.Module):
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]  # could be different if layer_past not None
             
-            if past_q_pos:
+            if past_q_pos: # use the complete reordered embedding. 
                 #B, L = past_q_pos.shape
-                pos_sin, pos_cos = self.get_pos_rotary_embedding(key_len, q_.device)
+                pos_sin, pos_cos = self.get_pos_rotary_embedding(key_len, q_.device) # only returns the still masked. 
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
                 #past_q_pos = past_q_pos.view(B, 1, L, 1).expand(B, pos_sin.shape[1], L, pos_sin.shape[-1])
@@ -480,7 +488,7 @@ class RotaryEmbedding(nn.Module):
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
             else:
-                pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+                pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device) # get the whole sequence. 
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
                 
@@ -768,6 +776,8 @@ class LLaDABlock(nn.Module):
             #    past_q_pos = torch.nonzero(~transfer_idx[0], as_tuple=True)[1].view(B, Q_T)
             #else:
             #    past_q_pos = None
+            
+            # THIS IS SAYING THAT: if transfer_idx is not None, and self._q_cache is True, then we use the reordered ROPE, else not. 
             q, k = self.rotary_emb(q, k, transfer_idx is not None and self._q_cache)
 
         if attention_bias is not None:
@@ -880,6 +890,7 @@ class LLaDASequentialBlock(LLaDABlock):
             q, k, v = self.att_proj(self.attn_norm(x)).split(self.fused_dims, dim=-1)
 
         # Get attention scores.
+        # layer_past and use_cache is irrelevant here
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
@@ -1004,6 +1015,7 @@ class LLaDALlamaBlock(LLaDABlock):
             # For Key
             if self._kv_cache:
                 k_proj = self.k_proj(x_normed)
+                # this ordering is consistent with the rope assembly method. 
                 k = torch.cat([k_proj, past_k], dim=1)
 
                 v_proj = self.v_proj(x_normed)
@@ -1017,6 +1029,7 @@ class LLaDALlamaBlock(LLaDABlock):
             k = self.k_proj(x_normed)
             v = self.v_proj(x_normed)
 
+        # in a refresh step
         if preprocess_cache and not use_cache:
             #if block_idx == 31:
             #   print("In preprocess_cache", transfer_idx[1])
@@ -1026,6 +1039,7 @@ class LLaDALlamaBlock(LLaDABlock):
             past_v = v[cache_position].view(B, -1, D)
             assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
             cache = (past_k, past_v)
+        # in a KV reuse step. 
         elif preprocess_cache and use_cache:
             #prv_transfer, cur_transfer = transfer_idx # for current transfer idx
             #print("prv:", prv_transfer, torch.nonzero(~prv_transfer, as_tuple=True)[1])
@@ -1046,6 +1060,7 @@ class LLaDALlamaBlock(LLaDABlock):
             
             prv_position = prv_position.unsqueeze(-1).expand(B, prv_position.shape[1], D)
             
+            # trying to get the original k and v from the concatenated k and v, reducing the MLP of KV. 
             ori_k = torch.zeros_like(k)
             ori_k = ori_k.scatter_(1, prv_position, k).view(B, prv_position.shape[1], D)  
             ori_v = torch.zeros_like(v)
@@ -1063,6 +1078,7 @@ class LLaDALlamaBlock(LLaDABlock):
             past_k = ori_k[cache_position].view(B, -1, D)
             past_v = ori_v[cache_position].view(B, -1, D)
             assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
+            # cache for the next reuse. 
             cache = (past_k, past_v)
             #
             #pre_cache, cur_cache = transfer_idx
@@ -1250,7 +1266,10 @@ class LLaDAModel(nn.Module):
                 ln_f=LayerNorm.build(config),
             )
         )
+        
+        print(config.block_type)
 
+        # so each llada block has the same cache and pos cache, which is for rope. 
         blocks = [LLaDABlock.build(i, config, self.__cache, self.__pos_cache) for i in range(config.n_layers)]
         if self.config.block_group_size > 1:
             block_groups = [
