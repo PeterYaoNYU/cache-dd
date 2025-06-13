@@ -151,6 +151,8 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                     torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l, the probability of the predicted tokens. 
             elif remasking == 'random':
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+            elif remasking == 'ar':
+                x0_p = torch.zeros_like(x0, dtype=torch.float64, device=x0.device)
             else:
                 raise NotImplementedError(remasking)
 
@@ -178,7 +180,11 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             for j in range(confidence.shape[0]):
-                _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                if remasking == 'ar':
+                    masked_pos = torch.nonzero(mask_index[j], as_tuple=True)[0]
+                    select_index = masked_pos[:num_transfer_tokens[j, i]]
+                else:
+                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                 transfer_index[j, select_index] = True
             
             x[transfer_index] = x0[transfer_index] 

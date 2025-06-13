@@ -42,7 +42,7 @@ def parser():
 def main():
     args = parser()
 
-    device = 'cuda'
+    device = 'cuda:3'
     if args.origin:
         from transformers import AutoModel as LLaDAModelLM
         from generation_utils.llada_generate import generate
@@ -63,7 +63,7 @@ def main():
 
     prompt = [
         "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
-        #"John plans to sell all his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have?",
+        "John plans to sell all his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have?",
     ] 
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
@@ -78,6 +78,8 @@ def main():
     )['input_ids'] 
     input_ids = torch.tensor(input_ids).to(device)
    
+    # begin time of generation
+    begin_time = time.time()
 
     out = generate(
         model, tokenizer, input_ids, 
@@ -88,6 +90,9 @@ def main():
         cache_reloading_step=args.cache_steps,
         window_size=args.window_size
     )
+    
+    end_time = time.time()
+    print(f"Generation time: {end_time - begin_time:.2f} seconds")
     
     res = tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)
     for r in res:
