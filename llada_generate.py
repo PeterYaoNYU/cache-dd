@@ -32,6 +32,8 @@ def parser():
     parser.add_argument("--decode", action="store_true")
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--future", action="store_true")
+    parser.add_argument("--future-simple", action="store_true")
+    
     
 
     # hyper-parameter for q-cache
@@ -57,6 +59,9 @@ def main():
     elif args.future:
         from models.modeling_llada_dkv_cache_future import LLaDAModelLM
         from generation_utils.llada_dkv_cache_future import generate
+    elif args.future_simple:
+        from models.modeling_llada_future import LLaDAModelLM
+        from generation_utils.llada_future import generate
     else:
         raise NotImplementedError
 

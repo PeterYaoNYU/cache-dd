@@ -1031,6 +1031,8 @@ class LLaDALlamaBlock(LLaDABlock):
                 # this ordering is consistent with the rope assembly method. 
                 k = torch.cat([k_proj, past_k], dim=1)
                 
+                
+                # todo check is it the right place to add the future cache???????????
                 # swap in future mask cache
                 k[cache_future_idx] = future_k
                 
@@ -1070,6 +1072,7 @@ class LLaDALlamaBlock(LLaDABlock):
             cache = (past_k, past_v)
             future_cache = (fut_k, fut_v)
         # in a KV reuse step. 
+        # TODO Not really reusing the kv cache for future far away tokens here. 
         elif preprocess_cache and use_cache:
             #prv_transfer, cur_transfer = transfer_idx # for current transfer idx
             #print("prv:", prv_transfer, torch.nonzero(~prv_transfer, as_tuple=True)[1])
