@@ -31,6 +31,8 @@ def parser():
     parser.add_argument("--origin", action="store_true")
     parser.add_argument("--decode", action="store_true")
     parser.add_argument("--greedy", action="store_true")
+    parser.add_argument("--future", action="store_true")
+    
 
     # hyper-parameter for q-cache
     parser.add_argument("--window-size", type=int, default=0)
@@ -52,6 +54,9 @@ def main():
     elif args.greedy:
         from models.modeling_llada_dkv_cache_greedy import LLaDAModelLM
         from generation_utils.llada_dkv_cache_greedy import generate
+    elif args.future:
+        from models.modeling_llada_dkv_cache_future import LLaDAModelLM
+        from generation_utils.llada_dkv_cache_future import generate
     else:
         raise NotImplementedError
 
