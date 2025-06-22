@@ -50,8 +50,6 @@ elif sys.version_info.minor == 8:
 else:
     raise SystemExit("This script supports Python 3.8 or higher")
 
-from torch.profiler import record_function
-
 __all__ = [
     "LayerNormBase",
     "LayerNorm",
@@ -382,6 +380,9 @@ class RotaryEmbedding(nn.Module):
     def get_pos_rotary_embedding_cache(self, transfer_idx): # transfer idx is actually ~prv_transfer_idx, previously masked tokens.
         pos_sin = self.__cache.get("rope_pos_sin")
         pos_cos = self.__cache.get("rope_pos_cos")
+        
+        
+        transfer_idx = transfer_idx.to(pos_sin.device, non_blocking=True)
 
         B, L = transfer_idx.shape
         _, H, _, D = pos_sin.shape # H = n_heads, D = d_model // n_heads (dimension per head. )
@@ -479,6 +480,12 @@ class RotaryEmbedding(nn.Module):
                 #past_q_pos = past_q_pos.view(B, 1, L, 1).expand(B, pos_sin.shape[1], L, pos_sin.shape[-1])
                 #output = torch.gather(pos_sin, dim=2, index=past_q_pos)
                 #print(past_q_pos.shape)
+                
+                # print("Using the complete positional embedding for q and k.")
+                # print("q_.shape:", q_.shape)
+                # print("k_.shape:", k_.shape)
+                # print("pos_sin.shape:", pos_sin.shape)
+                # print("pos_cos.shape:", pos_cos.shape)
               
                 q_ = self.apply_rotary_pos_emb(
                     pos_sin,
@@ -772,15 +779,7 @@ class LLaDABlock(nn.Module):
 
         if self.config.rope:
             # Apply rotary embeddings.
-            #if transfer_idx is not None and self._q_cache:
-                #print(transfer_idx)
-                #past_q_pos = torch.nonzero(~transfer_idx, as_tuple=True)[1].view(B, Q_T)
-            #    past_q_pos = torch.nonzero(~transfer_idx[0], as_tuple=True)[1].view(B, Q_T)
-            #else:
-            #    past_q_pos = None
-            
-            # THIS IS SAYING THAT: if transfer_idx is not None, and self._q_cache is True, then we use the reordered ROPE, else not. 
-            q, k = self.rotary_emb(q, k, transfer_idx is not None and self._q_cache)
+            q, k = self.rotary_emb(q, k)
 
         if attention_bias is not None:
             # Resize and cast attention bias.
@@ -995,6 +994,10 @@ class LLaDALlamaBlock(LLaDABlock):
         use_cache: bool = False,
         preprocess_cache: bool = False,
         block_idx: int = -100,
+        cache_future_idx: Optional[torch.BoolTensor] = None,
+        future_cache: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        idx_to_decode: Optional[torch.Tensor] = None,
+        cache_reuse_mask: Optional[torch.BoolTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -1008,24 +1011,33 @@ class LLaDALlamaBlock(LLaDABlock):
 
         if layer_past is not None and use_cache:
             past_k, past_v = layer_past
-            with record_function("cat_past_kv"):
-                past_k = past_k.contiguous()
-                past_v = past_v.contiguous()
+            past_k = past_k.contiguous()
+            past_v = past_v.contiguous()
 
-                # For Query
-                q = self.q_proj(x_normed)
+            # For Query
+            q = self.q_proj(x_normed)
 
-                # For Key
-                if self._kv_cache:
-                    k_proj = self.k_proj(x_normed)
-                    # this ordering is consistent with the rope assembly method. 
-                    k = torch.cat([k_proj, past_k], dim=1)
-
-                    v_proj = self.v_proj(x_normed)
-                    v = torch.cat([v_proj, past_v], dim=1)
-                else:
-                    k = self.k_proj(x_normed)
-                    v = self.v_proj(x_normed)
+            # For Key
+            if self._kv_cache:
+                k = self.k_proj(x_normed)
+                # this ordering is consistent with the rope assembly method. 
+                # k = torch.cat([k_proj, past_k], dim=1)
+                
+                
+                # todo check is it the right place to add the future cache???????????
+                # swap in future mask cache
+                
+                # print("k shape: ", k.shape, "past_k shape:", past_k.shape, "cache_reuse_mask shape:", cache_reuse_mask.shape)
+                k[cache_reuse_mask] = past_k[cache_reuse_mask]
+                
+                v = self.v_proj(x_normed)
+                # v = torch.cat([v_proj, past_v], dim=1)
+                
+                # swap in future mask cache
+                v[cache_reuse_mask] = past_v[cache_reuse_mask]
+            else:
+                k = self.k_proj(x_normed)
+                v = self.v_proj(x_normed)
     
         else:
             q = self.q_proj(x_normed)
@@ -1034,74 +1046,29 @@ class LLaDALlamaBlock(LLaDABlock):
 
         # in a refresh step
         if preprocess_cache and not use_cache:
-            #if block_idx == 31:
-            #   print("In preprocess_cache", transfer_idx[1])
-            cache_position = transfer_idx[1] # for current transfer idx
-            cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
-            past_k = k[cache_position].view(B, -1, D)
-            past_v = v[cache_position].view(B, -1, D)
-            assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
-            cache = (past_k, past_v)
+            # cache_position = transfer_idx[1] # for current transfer idx
+            # cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
+            # past_k = k[cache_position].view(B, -1, D)
+            # past_v = v[cache_position].view(B, -1, D)
+            # assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
+            
+            # if cache_future_idx is not None:
+            #     future_pos = cache_future_idx.unsqueeze(-1).expand(B, -1, D)
+            #     fut_k = k[future_pos].view(B, -1, D)
+            #     fut_v = v[future_pos].view(B, -1, D)
+                
+            # print("In preprocess_cache, future k shape:", fut_k.shape, "future v shape:", fut_v.shape)
+                
+            # print("returning past_k and past_v in preprocess_cache, past_k shape:", past_k.shape, "past_v shape:", past_v.shape)
+                
+            # directly pass the entire k and v to the cache. 
+            # the generation code should be responsible for deciding which cache to use. 
+            cache = (k, v)
         # in a KV reuse step. 
+        # TODO Not really reusing the kv cache for future far away tokens here. 
         elif preprocess_cache and use_cache:
-            #prv_transfer, cur_transfer = transfer_idx # for current transfer idx
-            #print("prv:", prv_transfer, torch.nonzero(~prv_transfer, as_tuple=True)[1])
-            #print("cur:", cur_transfer, torch.nonzero(~cur_transfer, as_tuple=True)[1])
-            #prv_cache_position = torch.nonzero(~prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-            #cur_remain_cache_position = torch.gather(cur_transfer, dim=1, index=prv_cache_position)
-            #new_past_k = k_proj[cur_remain_cache_position].view(B, -1, D)
-            #new_past_v = v_proj[cur_remain_cache_position].view(B, -1, D)
-            #all_past_k = torch.cat([new_past_k, past_k], dim=1)
-            #all_past_v = torch.cat([new_past_v, past_v], dim=1)
-            #past_k.scatter_(1, reorder_token_idx, all_past_k).scatter_(1, reorder_token_idx, new_past_k)
-            #print(cur_remain_cache_position)
-            #exit()
-            with record_function("scatter_reorder"):
-                prv_transfer, cur_transfer = transfer_idx
-                prv_cache_position = torch.nonzero(prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-                prv_not_cache_position = torch.nonzero(~prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-                prv_position = torch.cat([prv_not_cache_position, prv_cache_position], dim=-1)
-                
-                prv_position = prv_position.unsqueeze(-1).expand(B, prv_position.shape[1], D)
-                
-                # trying to get the original k and v from the concatenated k and v, reducing the MLP of KV. 
-                ori_k = torch.zeros_like(k)
-                ori_k = ori_k.scatter_(1, prv_position, k).view(B, prv_position.shape[1], D)  
-                ori_v = torch.zeros_like(v)
-                ori_v = ori_v.scatter_(1, prv_position, v).view(B, prv_position.shape[1], D)  
 
-
-                #reorder_token_idx = torch.nonzero(~prv_transfer_idx, as_tuple=True)[1].view(x0_p.shape[0], -1)
-                #refill_x0_p = refill_x0_p.scatter_(1, reorder_token_idx, x0_p)
-
-                #ori_k = k[prv_position].view(B, prv_position.shape[1], D) #torch.gather(k, dim=1, index=prv_position)
-                #ori_v = v[prv_position].view(B, prv_position.shape[1], D)#torch.gather(v, dim=1, index=prv_position)
-                
-                cache_position = cur_transfer
-                cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
-                past_k = ori_k[cache_position].view(B, -1, D)
-                past_v = ori_v[cache_position].view(B, -1, D)
-                assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
-                # cache for the next reuse. 
-                cache = (past_k, past_v)
-                #
-                #pre_cache, cur_cache = transfer_idx
-                #
-                #prv_cache_position = torch.nonzero(~pre_cache, as_tuple=True)[1].view(pre_cache.shape[0], -1)
-                #print("prv_cache_position:", prv_cache_position)
-                #print("pre_cache:", pre_cache)
-                #cur_step_remain_cache_position = torch.gather(cur_cache, dim=1, index=prv_cache_position)
-                #print("cur_step_remain_cache_position:", cur_step_remain_cache_position)
-    #
-                #dif_cache_values = 
-    #
-                ##dif_cache_position = not pre_cache and cur_cache
-                #
-                #exit()
-    #
-                #dif_cache_position = dif_cache_position.unsqueeze(-1).expand(B, -1, D)
-                #dif_past_k = k[cache_position].view(B, -1, D)
-                #dif_past_v = v[cache_position].view(B, -1, D)
+            cache = (past_k, past_v)
 
         
         else:
@@ -1135,7 +1102,7 @@ class LLaDALlamaBlock(LLaDABlock):
         x = self.dropout(x)
         x = og_x + x
 
-        return x, cache
+        return x, cache, future_cache, cache_future_idx
 
 
 class LLaDAOutput(NamedTuple):
@@ -1154,6 +1121,10 @@ class LLaDAOutput(NamedTuple):
     """
     Hidden states from each block.
     """
+    
+    future_cache: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]]
+    
+    future_cache_idx: Optional[Sequence[torch.BoolTensor]]
 
 
 class LLaDAGenerateOutput(NamedTuple):
@@ -1204,16 +1175,16 @@ class LLaDABlockGroup(nn.ModuleList):
                 )
             ):
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = self._activation_checkpoint_fn(  # type: ignore
+                x, cache, future_cache, future_cache_idx = self._activation_checkpoint_fn(  # type: ignore
                     block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, block_idx=block_idx
                 )
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, block_idx=block_idx)
+                x, cache, future_cache, future_cache_idx = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, block_idx=block_idx)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
-        return x, attn_key_values
+        return x, attn_key_values, future_cache, future_cache_idx
 
     def reset_parameters(self):
         for block in self:
@@ -1271,7 +1242,7 @@ class LLaDAModel(nn.Module):
             )
         )
         
-        print(config.block_type)
+        # print(config.block_type)
 
         # so each llada block has the same cache and pos cache, which is for rope. 
         blocks = [LLaDABlock.build(i, config, self.__cache, self.__pos_cache) for i in range(config.n_layers)]
@@ -1392,6 +1363,10 @@ class LLaDAModel(nn.Module):
         preprocess_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        cache_future_idx: Optional[torch.BoolTensor] = None,
+        future_cache: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        idx_to_decode: Optional[torch.LongTensor] = None,
+        cache_reuse_mask: Optional[torch.BoolTensor] = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1469,54 +1444,26 @@ class LLaDAModel(nn.Module):
         else:
             attention_mask = None
 
-        # Merge attention mask with attention bias.
-        # TODO: Check if this part effect the performance
-        #if (
-        #    attention_bias is not None
-        #    or attention_mask is not None
-        #    or self.config.alibi
-        #    # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
-        #    # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
-        #    # scores correctly.
-        #    or past_query_key_values is not None
-        #):
-        #    if attention_bias is None and self.config.alibi:
-        #        attention_bias = get_causal_attention_bias(
-        #            self.__cache, past_length + seq_len, x.device
-        #        ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
-        #    elif attention_bias is None:
-        #        attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
-        #    elif attention_bias.dtype in (torch.int8, torch.bool):
-        #        attention_bias = attention_bias.to(dtype=torch.float)
-        #        attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
-#
-        #    # Transform to the right shape and data type.
-        #    mask_len = seq_len
-        #    if attention_mask is not None:
-        #        mask_len = attention_mask.shape[-1]
-        #    elif past_query_key_values is not None:
-        #        mask_len = past_query_key_values[0][0].shape[-2] + seq_len
-        #    attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
-#
-        #    # Add in the masking bias.
-        #    if attention_mask is not None:
-        #        attention_bias = attention_bias + attention_mask
-        #        # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
-        #        # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
-        #        # it can produce NaNs.
-        #        ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
-
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] #if use_cache else None
+
+        future_cache_list: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = []
+        future_cache_idx_list: Optional[Sequence[torch.BoolTensor]] = []
 
         # decoder layers
         all_hidden_states = []
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
+            # print("Block group size is 1")
             for block_idx, block in enumerate(self.transformer.blocks):
                 if output_hidden_states:
                     # add hidden states
                     all_hidden_states.append(x)
+            
+                # print("Block idx:", block_idx, " cache future type: ", type(future_cache))
+                
+                # if future_cache is not None:
+                #     print("future cache length:", len(future_cache), "future cache [0] type:", type(future_cache[0]))
 
                 layer_past = None if past_query_key_values is None or not use_cache else past_query_key_values[0][block_idx]
                 transfer_idx = past_query_key_values[1] if past_query_key_values is not None else None
@@ -1536,21 +1483,27 @@ class LLaDAModel(nn.Module):
                     )
                 ):
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = self._activation_checkpoint_fn(
+                    x, cache, new_future_cache, future_cache_idx = self._activation_checkpoint_fn(
                         block, x, attention_bias=attention_bias, 
                         layer_past=layer_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache, 
-                        block_idx=block_idx
+                        block_idx=block_idx, cache_future_idx=cache_future_idx, future_cache=future_cache[block_idx] if future_cache is not None else None,
+                        idx_to_decode=idx_to_decode,
+                        cache_reuse_mask=cache_reuse_mask,
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(
+                    x, cache, new_future_cache, future_cache_idx = block(
                         x, attention_bias=attention_bias, 
                         layer_past=layer_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache,
-                        block_idx=block_idx
+                        block_idx=block_idx, cache_future_idx=cache_future_idx, future_cache=future_cache[block_idx] if future_cache is not None else None,
+                        idx_to_decode=idx_to_decode,
+                        cache_reuse_mask=cache_reuse_mask,
                     )
-                if attn_key_values is not None:
                     #assert cache is not None
-                    attn_key_values.append(cache)
+                attn_key_values.append(cache)
+                    
+                future_cache_list.append(new_future_cache)
+                future_cache_idx_list.append(future_cache_idx)
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
                 if output_hidden_states:
@@ -1566,11 +1519,14 @@ class LLaDAModel(nn.Module):
                 )
                 x, cache = block_group(
                     x, attention_bias=attention_bias, 
-                    layers_past=layers_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache,
+                    layers_past=layers_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache, cache_future_idx=cache_future_idx
                 )
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.extend(cache)
+                    
+                future_cache_list.append(future_cache)
+                future_cache_idx_list.append(future_cache_idx)
 
         if last_logits_only:
             # shape: (batch_size, 1, d_model)
@@ -1592,7 +1548,8 @@ class LLaDAModel(nn.Module):
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None, 
+                           future_cache=future_cache_list, future_cache_idx=future_cache_idx_list)  # type: ignore[arg-type]
 
 
 def create_model_config_from_pretrained_config(config: LLaDAConfig):
@@ -1619,6 +1576,8 @@ class LLaDAModelLM(PreTrainedModel):
 
     def __init__(self, config: LLaDAConfig, model: Optional[LLaDAModel] = None, init_params: bool = False):
         super().__init__(config)
+        
+        self.future_cache_idx = None
 
         if not model:
             model_config = create_model_config_from_pretrained_config(config)
@@ -1630,8 +1589,19 @@ class LLaDAModelLM(PreTrainedModel):
 
         self._q_cache, self._kv_cache = False, False
 
-    def get_pos_rotary_embedding_cache(self, transfer_idx):
+    def get_pos_rotary_embedding_cache(self, transfer_idx, decode_now_idx):
+        # for rope reordering also taking into account the cache transfer idx.
+        
+        # print("Transfer idx:", transfer_idx.shape)
+        # print("Decode now idx:", decode_now_idx.shape)  
+        
+        # if decode_now_idx is not None:
+        #     far_enough = torch.cumsum(~decode_now_idx, dim=1) > 32
+        # print("Far enough:", far_enough.shape)
+        # uncached_mask = transfer_idx & (~far_enough)
+        
         self.model.get_pos_rotary_embedding_cache(transfer_idx)
+        # self.model.get_pos_rotary_embedding_cache(uncached_mask)
 
     def reset_pos_rotary_embedding_cache(self):
         self.model.reset_pos_rotary_embedding_cache()
@@ -1656,7 +1626,12 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
         preprocess_cache: Optional[bool] = False,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        decode_now_idx: Optional[torch.BoolTensor] = None,
+        future_cache_idx: Optional[torch.BoolTensor] = None,
+        future_cache: Optional[List[torch.FloatTensor]] = None,
+        idx_to_decode: Optional[torch.LongTensor] = None,
+        cache_reuse_mask: Optional[torch.BoolTensor] = None,
+    ) :
         if use_cache is None:
             use_cache = self.config.use_cache
 
@@ -1664,6 +1639,18 @@ class LLaDAModelLM(PreTrainedModel):
             raise ValueError("output_attentions is not yet supported in LLaDA")
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # future_cache_idx: Optional[torch.BoolTensor] = None
+        # if decode_now_idx is not None:
+            # still_masked = (input_ids == 126336) # [Mask] id
+            # far_enough = torch.cumsum(~decode_now_idx, dim=1) > 32
+            # future_cache_idx =  far_enough
+            # # for rope reordering
+            # self.future_cache_idx = future_cache_idx
+            
+        # print("future cache", type(future_cache))
+        # if future_cache is not None:
+        #     print("future cache length:", len(future_cache), "future cache [0] type:", type(future_cache[0]))
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.forward(
@@ -1675,6 +1662,10 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             preprocess_cache=preprocess_cache,
             output_hidden_states=output_hidden_states,
+            cache_future_idx=future_cache_idx,
+            future_cache=future_cache,
+            idx_to_decode=idx_to_decode,
+            cache_reuse_mask = cache_reuse_mask,
         )
 
         logits = outputs.logits
@@ -1688,11 +1679,7 @@ class LLaDAModelLM(PreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
-            logits=logits,
-            past_key_values=outputs.attn_key_values,
-            hidden_states=hidden_states,
-        )
+        return outputs
 
     def can_generate(self) -> bool:
         return True

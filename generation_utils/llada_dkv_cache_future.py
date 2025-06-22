@@ -105,7 +105,7 @@ def trim_and_update_future_cache(
 
 @ torch.no_grad()
 def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336, enable_cache=False, cache_reloading_step=1, **kwargs):
+             cfg_scale=0., remasking='low_confidence', mask_id=126336, enable_cache=False, cache_reloading_step=4, **kwargs):
     '''
     Args:
         model: Mask predictor.

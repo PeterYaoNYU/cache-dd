@@ -111,7 +111,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 if remasking == 'ar':
                     masked_pos = torch.nonzero(mask_index[j], as_tuple=True)[0]
                     select_index = masked_pos[:num_transfer_tokens[j, i]]
-                    print(f"Step {i}, Block {num_block}, Batch {j}, Selected indices: {select_index}")
+                    # print(f"Step {i}, Block {num_block}, Batch {j}, Selected indices: {select_index}")
                 else:
                     _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                 transfer_index[j, select_index] = True

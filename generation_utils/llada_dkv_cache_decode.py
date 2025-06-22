@@ -10,6 +10,8 @@ from models.modeling_llada_dkv_cache_decode import LLaDAModelLM
 
 import time
 
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
+
 def set_random_seed(seed):
     """
     Set the random seed for reproducibility.
@@ -242,7 +244,7 @@ def main():
         steps=128, gen_length=128, block_length=32, 
         temperature=0., cfg_scale=0., 
         remasking='low_confidence',
-        enable_cache=False,
+        enable_cache=True,
         cache_reloading_step=4
     )
     print("Total Decoding Time = ", time.time() - decoding_start_time)

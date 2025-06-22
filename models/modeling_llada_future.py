@@ -913,9 +913,15 @@ class LLaDALlamaBlock(LLaDABlock):
         k = self.k_proj(x_normed)
         v = self.v_proj(x_normed)
         
-        if future_cache is not None:
-            k[cache_future_idx] = future_k
-            v[cache_future_idx] = future_v  
+        if (future_cache is not None) and use_cache:
+            # print("Using future cache in LLaDALlamaBlock")
+            # # print(f"future_k shape: {future_k.shape}, future_v shape: {future_v.shape}")
+            # print("future k index: ", cache_future_idx)
+            # print("cache future idx shape: ", cache_future_idx.shape)
+            for b in range(B):
+                idx = cache_future_idx[b]            # (L,) bool
+                k[b, idx] = future_k[b]              # (n_i, D)
+                v[b, idx] = future_v[b]
         
         # in a refresh step
         if preprocess_cache and not use_cache:

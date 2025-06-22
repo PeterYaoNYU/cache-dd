@@ -33,6 +33,7 @@ def parser():
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--future", action="store_true")
     parser.add_argument("--future-simple", action="store_true")
+    parser.add_argument("--selective_conv", action="store_true")
     
     
 
@@ -46,7 +47,7 @@ def parser():
 def main():
     args = parser()
 
-    device = 'cuda:3'
+    device = 'cuda:6'
     if args.origin:
         from transformers import AutoModel as LLaDAModelLM
         from generation_utils.llada_generate import generate
@@ -62,6 +63,9 @@ def main():
     elif args.future_simple:
         from models.modeling_llada_future import LLaDAModelLM
         from generation_utils.llada_future import generate
+    elif args.selective_conv:
+        from models.modeling_llada_selective import LLaDAModelLM
+        from generation_utils.llada_cache_selective import generate
     else:
         raise NotImplementedError
 
@@ -72,7 +76,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
     prompt = [
-        "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
+        # "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
         "John plans to sell all his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have?",
     ] 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import math
 import sys
-import time
 from abc import abstractmethod
 from collections import defaultdict
 from functools import partial
@@ -32,7 +31,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModel
 from transformers.cache_utils import Cache
 
-from models.configuration_llada import (
+from .configuration_llada import (
     LLaDAConfig,
     StrEnum,
     InitFnType,
@@ -49,8 +48,6 @@ elif sys.version_info.minor == 8:
     from typing import MutableMapping
 else:
     raise SystemExit("This script supports Python 3.8 or higher")
-
-from torch.profiler import record_function
 
 __all__ = [
     "LayerNormBase",
@@ -368,46 +365,14 @@ class RotaryEmbedding(nn.Module):
     [Rotary positional embeddings (RoPE)](https://arxiv.org/abs/2104.09864).
     """
 
-    def __init__(self, config: ModelConfig, cache: BufferCache, pos_cache: BufferCache):
+    def __init__(self, config: ModelConfig, cache: BufferCache):
         super().__init__()
         self.config = config
-        # this is rather static
         self.__cache = cache
-        # this change with transfer index. 
-        self.__pos_cache = pos_cache
         # Warm up cache.
         self.rope_theta = config.rope_theta
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
 
-    def get_pos_rotary_embedding_cache(self, transfer_idx): # transfer idx is actually ~prv_transfer_idx, previously masked tokens.
-        pos_sin = self.__cache.get("rope_pos_sin")
-        pos_cos = self.__cache.get("rope_pos_cos")
-
-        B, L = transfer_idx.shape
-        _, H, _, D = pos_sin.shape # H = n_heads, D = d_model // n_heads (dimension per head. )
-        #q_pos = torch.nonzero(~transfer_idx, as_tuple=True)[1].view(B, 1, -1, 1) # B, 1, num_masked, 1
-        transfer_idx = transfer_idx.view(B, 1, -1, 1)
-        transfer_idx = transfer_idx.expand(B, H, transfer_idx.shape[-2], D)
-       
-        pos_sin = pos_sin[:, :, :L, :].repeat(B, 1, 1, 1) # expand from (1, H, L, D) to (B, H, L, D) 
-        pos_cos = pos_cos[:, :, :L, :].repeat(B, 1, 1, 1)
-        
-        # here transfer_idx refers to ~prv_transfer_idx, which is the tokens still masked in the previous timestep. 
-        self.__pos_cache["rope_pos_sin_pos_cache"] = pos_sin[transfer_idx].view(B, H, -1, D)
-        self.__pos_cache["rope_pos_cos_pos_cache"] = pos_cos[transfer_idx].view(B, H, -1, D)
-
-        # this is the tokens already unmasked in the last round. 
-        self.__pos_cache["rope_pos_sin_pos_cache_transferred"] = pos_sin[~transfer_idx].view(B, H, -1, D)
-        self.__pos_cache["rope_pos_cos_pos_cache_transferred"] = pos_cos[~transfer_idx].view(B, H, -1, D)
-
-
-    def reset_pos_rotary_embedding_cache(self):
-        self.__pos_cache["rope_pos_sin_pos_cache"] = None
-        self.__pos_cache["rope_pos_cos_pos_cache"] = None
-        self.__pos_cache["rope_pos_sin_pos_cache_transferred"] = None
-        self.__pos_cache["rope_pos_cos_pos_cache_transferred"] = None
-
-    # this function is for static cache geenration. 
     def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
             (pos_sin := self.__cache.get("rope_pos_sin")) is not None
@@ -427,31 +392,12 @@ class RotaryEmbedding(nn.Module):
             dim = self.config.d_model // self.config.n_heads
             inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim))
             seq = torch.arange(seq_len, device=device, dtype=torch.float)
-
             freqs = einsum("i , j -> i j", seq, inv_freq)
             positions = torch.cat((freqs, freqs), dim=-1)
             pos_sin, pos_cos = positions.sin()[None, None, :, :], positions.cos()[None, None, :, :]
         self.__cache["rope_pos_sin"] = pos_sin
         self.__cache["rope_pos_cos"] = pos_cos
         return pos_sin, pos_cos
-
-    # this returns the still masked. 
-    def get_pos_rotary_embedding(self, seq_len:int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        pos_sin = self.__pos_cache.get("rope_pos_sin_pos_cache")
-        pos_cos = self.__pos_cache.get("rope_pos_cos_pos_cache")
-        assert pos_sin is not None
-        assert pos_cos is not None
-
-        return pos_sin, pos_cos
-
-    # this returns a concatenated reordered version of the complete sequence, masked or unmasked. 
-    def get_k_pos_rotary_embedding(self, seq_len:int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        pos_sin_masked = self.__pos_cache.get("rope_pos_sin_pos_cache")
-        pos_cos_masked = self.__pos_cache.get("rope_pos_cos_pos_cache")
-        pos_sin_unmasked = self.__pos_cache["rope_pos_sin_pos_cache_transferred"]
-        pos_cos_unmasked = self.__pos_cache["rope_pos_cos_pos_cache_transferred"]
-
-        return torch.cat([pos_sin_masked, pos_sin_unmasked], dim=-2), torch.cat([pos_cos_masked, pos_cos_unmasked], dim=-2)
 
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         B, nh, T, hs = x.size()
@@ -462,7 +408,7 @@ class RotaryEmbedding(nn.Module):
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, past_q_pos: Optional[torch.bool] = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -470,37 +416,14 @@ class RotaryEmbedding(nn.Module):
 
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]  # could be different if layer_past not None
-            
-            if past_q_pos: # use the complete reordered embedding. 
-                #B, L = past_q_pos.shape
-                pos_sin, pos_cos = self.get_pos_rotary_embedding(key_len, q_.device) # only returns the still masked. 
-                pos_sin = pos_sin.type_as(q_)
-                pos_cos = pos_cos.type_as(q_)
-                #past_q_pos = past_q_pos.view(B, 1, L, 1).expand(B, pos_sin.shape[1], L, pos_sin.shape[-1])
-                #output = torch.gather(pos_sin, dim=2, index=past_q_pos)
-                #print(past_q_pos.shape)
-              
-                q_ = self.apply_rotary_pos_emb(
-                    pos_sin,
-                    pos_cos,
-                    q_,
-                )
-                # For k use
-                pos_sin, pos_cos = self.get_k_pos_rotary_embedding(key_len, q_.device)
-                pos_sin = pos_sin.type_as(q_)
-                pos_cos = pos_cos.type_as(q_)
-            else:
-                pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device) # get the whole sequence. 
-                pos_sin = pos_sin.type_as(q_)
-                pos_cos = pos_cos.type_as(q_)
-                
-                q_ = self.apply_rotary_pos_emb(
-                    pos_sin[:, :, key_len - query_len : key_len, :],
-                    pos_cos[:, :, key_len - query_len : key_len, :],
-                    q_,
-                )
-            
-            
+            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+            pos_sin = pos_sin.type_as(q_)
+            pos_cos = pos_cos.type_as(q_)
+            q_ = self.apply_rotary_pos_emb(
+                pos_sin[:, :, key_len - query_len : key_len, :],
+                pos_cos[:, :, key_len - query_len : key_len, :],
+                q_,
+            )
             k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
         return q_.type_as(q), k_.type_as(k)
 
@@ -600,7 +523,7 @@ class LLaDABlock(nn.Module):
     A base class for transformer block implementations.
     """
 
-    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache, pos_cache: BufferCache):
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
@@ -608,7 +531,6 @@ class LLaDABlock(nn.Module):
             config.mlp_hidden_size if config.mlp_hidden_size is not None else config.mlp_ratio * config.d_model
         )
         self.__cache = cache
-        self.__pos_cache = pos_cache
         assert config.d_model % config.n_heads == 0
 
         self._activation_checkpoint_fn = None
@@ -647,7 +569,7 @@ class LLaDABlock(nn.Module):
 
         # Rotary embeddings.
         if self.config.rope:
-            self.rotary_emb = RotaryEmbedding(config, self.__cache, self.__pos_cache)
+            self.rotary_emb = RotaryEmbedding(config, self.__cache)
 
         self.flash_attn_func = None
         if config.flash_attention:
@@ -657,9 +579,6 @@ class LLaDABlock(nn.Module):
                 self.flash_attn_func = flash_attn_func
             except ModuleNotFoundError:
                 pass
-
-        # For QKV Cache
-        self._q_cache, self._kv_cache = False, False
 
     def reset_parameters(self):
         if self.k_norm is not None:
@@ -729,8 +648,7 @@ class LLaDABlock(nn.Module):
                 assert num_q_heads % num_kv_heads == 0
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
-            
-            
+
             # Modify: MDM set causal to False, and with no attn_mask.
             return F.scaled_dot_product_attention(
                 q,
@@ -749,10 +667,8 @@ class LLaDABlock(nn.Module):
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-        transfer_idx: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        B, Q_T, C = q.size()  # batch size, sequence length, d_model
-        _, KV_T, _ = k.size()
+        B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
 
         # Optionally apply layer norm to keys and queries.
@@ -762,25 +678,23 @@ class LLaDABlock(nn.Module):
 
         # Move head forward to be next to the batch dim.
         # shape: (B, nh, T, hs)
-        q = q.view(B, Q_T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
+        q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
         # shape: (B, n_kv_h, T, hs)
-        k = k.view(B, KV_T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
         # shape: (B, n_kv_h, T, hs)
-        v = v.view(B, KV_T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
+        v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
 
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            k = torch.cat((past_key, k), dim=-2)
+            v = torch.cat((past_value, v), dim=-2)
+
+        present = (k, v) if use_cache else None
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
 
         if self.config.rope:
             # Apply rotary embeddings.
-            #if transfer_idx is not None and self._q_cache:
-                #print(transfer_idx)
-                #past_q_pos = torch.nonzero(~transfer_idx, as_tuple=True)[1].view(B, Q_T)
-            #    past_q_pos = torch.nonzero(~transfer_idx[0], as_tuple=True)[1].view(B, Q_T)
-            #else:
-            #    past_q_pos = None
-            
-            # THIS IS SAYING THAT: if transfer_idx is not None, and self._q_cache is True, then we use the reordered ROPE, else not. 
-            q, k = self.rotary_emb(q, k, transfer_idx is not None and self._q_cache)
+            q, k = self.rotary_emb(q, k)
 
         if attention_bias is not None:
             # Resize and cast attention bias.
@@ -802,15 +716,12 @@ class LLaDABlock(nn.Module):
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
-        #import time
-        #if self.layer_id == 31:
-        #    torch.save(att, f'att_{time.time()}.pt')
 
         # Re-assemble all head outputs side-by-side.
-        att = att.transpose(1, 2).contiguous().view(B, Q_T, C)
+        att = att.transpose(1, 2).contiguous().view(B, T, C)
 
         # Apply output projection.
-        return self.attn_out(att)
+        return self.attn_out(att), present
 
     @abstractmethod
     def forward(
@@ -823,11 +734,11 @@ class LLaDABlock(nn.Module):
         raise NotImplementedError
 
     @classmethod
-    def build(cls, layer_id: int, config: ModelConfig, cache: BufferCache, pos_cache: BufferCache) -> LLaDABlock:
+    def build(cls, layer_id: int, config: ModelConfig, cache: BufferCache) -> LLaDABlock:
         if config.block_type == BlockType.sequential:
-            return LLaDASequentialBlock(layer_id, config, cache, pos_cache)
+            return LLaDASequentialBlock(layer_id, config, cache)
         elif config.block_type == BlockType.llama:
-            return LLaDALlamaBlock(layer_id, config, cache, pos_cache)
+            return LLaDALlamaBlock(layer_id, config, cache)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
@@ -892,7 +803,6 @@ class LLaDASequentialBlock(LLaDABlock):
             q, k, v = self.att_proj(self.attn_norm(x)).split(self.fused_dims, dim=-1)
 
         # Get attention scores.
-        # layer_past and use_cache is irrelevant here
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
@@ -931,13 +841,12 @@ class LLaDALlamaBlock(LLaDABlock):
     behavior of Llama.
     """
 
-    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache, pos_cache: BufferCache):
-        super().__init__(layer_id, config, cache, pos_cache)
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache)
         # Layer norms.
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
         self.__cache = cache
-        self.__pos_cache = pos_cache
 
         # Attention input projection. Projects x -> (q, k, v)
         head_dim = config.d_model // config.n_heads
@@ -963,18 +872,6 @@ class LLaDALlamaBlock(LLaDABlock):
             config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
         )
 
-        self._q_cache, self._kv_cache = False, False
-
-    def get_pos_rotary_embedding_cache(self, transfer_idx):
-        self.rotary_emb.get_pos_rotary_embedding_cache(transfer_idx)
-
-    def reset_pos_rotary_embedding_cache(self):
-        self.rotary_emb.reset_pos_rotary_embedding_cache()
-
-    def set_qkv_cache(self, q_cache: bool, kv_cache: bool):
-        self._q_cache = q_cache
-        self._kv_cache = kv_cache
-
     def reset_parameters(self):
         super().reset_parameters()
         self.attn_norm.reset_parameters()
@@ -991,10 +888,7 @@ class LLaDALlamaBlock(LLaDABlock):
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        transfer_idx: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        preprocess_cache: bool = False,
-        block_idx: int = -100,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -1004,118 +898,20 @@ class LLaDALlamaBlock(LLaDABlock):
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
         x_normed = self.attn_norm(x)
-        B, L, D = x_normed.shape
-
-        if layer_past is not None and use_cache:
-            past_k, past_v = layer_past
-            with record_function("cat_past_kv"):
-                past_k = past_k.contiguous()
-                past_v = past_v.contiguous()
-
-                # For Query
-                q = self.q_proj(x_normed)
-
-                # For Key
-                if self._kv_cache:
-                    k_proj = self.k_proj(x_normed)
-                    # this ordering is consistent with the rope assembly method. 
-                    k = torch.cat([k_proj, past_k], dim=1)
-
-                    v_proj = self.v_proj(x_normed)
-                    v = torch.cat([v_proj, past_v], dim=1)
-                else:
-                    k = self.k_proj(x_normed)
-                    v = self.v_proj(x_normed)
-    
-        else:
-            q = self.q_proj(x_normed)
-            k = self.k_proj(x_normed)
-            v = self.v_proj(x_normed)
-
-        # in a refresh step
-        if preprocess_cache and not use_cache:
-            #if block_idx == 31:
-            #   print("In preprocess_cache", transfer_idx[1])
-            cache_position = transfer_idx[1] # for current transfer idx
-            cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
-            past_k = k[cache_position].view(B, -1, D)
-            past_v = v[cache_position].view(B, -1, D)
-            assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
-            cache = (past_k, past_v)
-        # in a KV reuse step. 
-        elif preprocess_cache and use_cache:
-            #prv_transfer, cur_transfer = transfer_idx # for current transfer idx
-            #print("prv:", prv_transfer, torch.nonzero(~prv_transfer, as_tuple=True)[1])
-            #print("cur:", cur_transfer, torch.nonzero(~cur_transfer, as_tuple=True)[1])
-            #prv_cache_position = torch.nonzero(~prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-            #cur_remain_cache_position = torch.gather(cur_transfer, dim=1, index=prv_cache_position)
-            #new_past_k = k_proj[cur_remain_cache_position].view(B, -1, D)
-            #new_past_v = v_proj[cur_remain_cache_position].view(B, -1, D)
-            #all_past_k = torch.cat([new_past_k, past_k], dim=1)
-            #all_past_v = torch.cat([new_past_v, past_v], dim=1)
-            #past_k.scatter_(1, reorder_token_idx, all_past_k).scatter_(1, reorder_token_idx, new_past_k)
-            #print(cur_remain_cache_position)
-            #exit()
-            with record_function("scatter_reorder"):
-                prv_transfer, cur_transfer = transfer_idx
-                prv_cache_position = torch.nonzero(prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-                prv_not_cache_position = torch.nonzero(~prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
-                prv_position = torch.cat([prv_not_cache_position, prv_cache_position], dim=-1)
-                
-                prv_position = prv_position.unsqueeze(-1).expand(B, prv_position.shape[1], D)
-                
-                # trying to get the original k and v from the concatenated k and v, reducing the MLP of KV. 
-                ori_k = torch.zeros_like(k)
-                ori_k = ori_k.scatter_(1, prv_position, k).view(B, prv_position.shape[1], D)  
-                ori_v = torch.zeros_like(v)
-                ori_v = ori_v.scatter_(1, prv_position, v).view(B, prv_position.shape[1], D)  
-
-
-                #reorder_token_idx = torch.nonzero(~prv_transfer_idx, as_tuple=True)[1].view(x0_p.shape[0], -1)
-                #refill_x0_p = refill_x0_p.scatter_(1, reorder_token_idx, x0_p)
-
-                #ori_k = k[prv_position].view(B, prv_position.shape[1], D) #torch.gather(k, dim=1, index=prv_position)
-                #ori_v = v[prv_position].view(B, prv_position.shape[1], D)#torch.gather(v, dim=1, index=prv_position)
-                
-                cache_position = cur_transfer
-                cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
-                past_k = ori_k[cache_position].view(B, -1, D)
-                past_v = ori_v[cache_position].view(B, -1, D)
-                assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
-                # cache for the next reuse. 
-                cache = (past_k, past_v)
-                #
-                #pre_cache, cur_cache = transfer_idx
-                #
-                #prv_cache_position = torch.nonzero(~pre_cache, as_tuple=True)[1].view(pre_cache.shape[0], -1)
-                #print("prv_cache_position:", prv_cache_position)
-                #print("pre_cache:", pre_cache)
-                #cur_step_remain_cache_position = torch.gather(cur_cache, dim=1, index=prv_cache_position)
-                #print("cur_step_remain_cache_position:", cur_step_remain_cache_position)
-    #
-                #dif_cache_values = 
-    #
-                ##dif_cache_position = not pre_cache and cur_cache
-                #
-                #exit()
-    #
-                #dif_cache_position = dif_cache_position.unsqueeze(-1).expand(B, -1, D)
-                #dif_past_k = k[cache_position].view(B, -1, D)
-                #dif_past_v = v[cache_position].view(B, -1, D)
-
-        
-        else:
-            cache = None
-
+        q = self.q_proj(x_normed)
+        k = self.k_proj(x_normed)
+        v = self.v_proj(x_normed)
 
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
-            att = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, transfer_idx=transfer_idx
+            att, cache = self._activation_checkpoint_fn(  # type: ignore
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
             )
         else:
-            att = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache, transfer_idx=transfer_idx)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
 
+        # Add attention scores.
+        # shape: (B, T, C)
         x = x + self.dropout(att)
 
         # Add feed-forward projection.
@@ -1205,11 +1001,11 @@ class LLaDABlockGroup(nn.ModuleList):
             ):
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, block_idx=block_idx
+                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
                 )
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache, block_idx=block_idx)
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
@@ -1230,7 +1026,6 @@ class LLaDAModel(nn.Module):
         super().__init__()
         self.config = config
         self.__cache = BufferCache()
-        self.__pos_cache = BufferCache()
 
         # Validate config.
         if self.config.alibi and self.config.flash_attention:
@@ -1270,11 +1065,8 @@ class LLaDAModel(nn.Module):
                 ln_f=LayerNorm.build(config),
             )
         )
-        
-        print(config.block_type)
 
-        # so each llada block has the same cache and pos cache, which is for rope. 
-        blocks = [LLaDABlock.build(i, config, self.__cache, self.__pos_cache) for i in range(config.n_layers)]
+        blocks = [LLaDABlock.build(i, config, self.__cache) for i in range(config.n_layers)]
         if self.config.block_group_size > 1:
             block_groups = [
                 LLaDABlockGroup(config, i, blocks[i : i + config.block_group_size])
@@ -1308,21 +1100,6 @@ class LLaDAModel(nn.Module):
         if self.config.alibi:
             get_causal_attention_bias(self.__cache, config.max_sequence_length, _non_meta_init_device(config))
             self.get_alibi_attention_bias(config.max_sequence_length, _non_meta_init_device(config))
-
-        self._q_cache, self._kv_cache = False, False
-
-    def get_pos_rotary_embedding_cache(self, transfer_idx):
-        self.transformer.blocks[0].get_pos_rotary_embedding_cache(transfer_idx)
-
-    def reset_pos_rotary_embedding_cache(self):
-        self.transformer.blocks[0].reset_pos_rotary_embedding_cache()
-
-    def set_qkv_cache(self, q_cache: bool, kv_cache: bool):
-        self._q_cache = q_cache
-        self._kv_cache = kv_cache
-
-        for block in self.transformer.blocks:
-            block.set_qkv_cache(q_cache, kv_cache)
 
     def set_activation_checkpointing(self, strategy: Optional[ActivationCheckpointingStrategy]):
         self.activation_checkpointing_strategy = strategy
@@ -1387,9 +1164,8 @@ class LLaDAModel(nn.Module):
         input_embeddings: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
-        past_query_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[Sequence[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
-        preprocess_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
     ) -> LLaDAOutput:
@@ -1426,21 +1202,18 @@ class LLaDAModel(nn.Module):
         # Add Basic MDM Model config check
         assert not self.config.alibi, "Alibi length extrapolation is not supported for MDM."
         assert self.config.rope, "Rope must be used in Llama-Encoder for MDM."
-        #assert past_query_key_values is None or (past_query_key_values is not None and use_cache), "past_query_key_values can only be used with use_cache=True."
+        assert (past_key_values is None and not use_cache), "The kvcache is not suppotred for MDM."
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
 
-        if past_query_key_values and use_cache:
-            assert len(past_query_key_values[0]) == self.config.n_layers
-            assert len(past_query_key_values) == 2
+        if past_key_values:
+            assert len(past_key_values) == self.config.n_layers
 
         batch_size, seq_len = input_ids.size() if input_embeddings is None else input_embeddings.size()[:2]
-        #if past_query_key_values is None:
-        #    past_length = 0
-        #else:
-            # TODO(MA): Check if the past length is correct
-            #past_length = past_query_key_values[0][0].size(-2)
-            #print(past_length)
+        if past_key_values is None:
+            past_length = 0
+        else:
+            past_length = past_key_values[0][0].size(-2)
 
         # Get embeddings of input.
         # shape: (batch_size, seq_len, d_model)
@@ -1449,13 +1222,13 @@ class LLaDAModel(nn.Module):
         if self.config.input_emb_norm:
             x = x * (self.config.d_model**0.5)
 
-        #if not (self.config.alibi or self.config.rope):
+        if not (self.config.alibi or self.config.rope):
             # Get positional embeddings.
             # shape: (1, seq_len)
-            #pos = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
+            pos = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
             # shape: (1, seq_len, d_model)
-            #pos_emb = self.transformer.wpe(pos)  # type: ignore
-            #x = pos_emb + x
+            pos_emb = self.transformer.wpe(pos)  # type: ignore
+            x = pos_emb + x
 
         # Add input + positional embeddings and apply dropout.
         # shape: (batch_size, seq_len, d_model)
@@ -1470,43 +1243,42 @@ class LLaDAModel(nn.Module):
             attention_mask = None
 
         # Merge attention mask with attention bias.
-        # TODO: Check if this part effect the performance
-        #if (
-        #    attention_bias is not None
-        #    or attention_mask is not None
-        #    or self.config.alibi
-        #    # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
-        #    # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
-        #    # scores correctly.
-        #    or past_query_key_values is not None
-        #):
-        #    if attention_bias is None and self.config.alibi:
-        #        attention_bias = get_causal_attention_bias(
-        #            self.__cache, past_length + seq_len, x.device
-        #        ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
-        #    elif attention_bias is None:
-        #        attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
-        #    elif attention_bias.dtype in (torch.int8, torch.bool):
-        #        attention_bias = attention_bias.to(dtype=torch.float)
-        #        attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
-#
-        #    # Transform to the right shape and data type.
-        #    mask_len = seq_len
-        #    if attention_mask is not None:
-        #        mask_len = attention_mask.shape[-1]
-        #    elif past_query_key_values is not None:
-        #        mask_len = past_query_key_values[0][0].shape[-2] + seq_len
-        #    attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
-#
-        #    # Add in the masking bias.
-        #    if attention_mask is not None:
-        #        attention_bias = attention_bias + attention_mask
-        #        # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
-        #        # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
-        #        # it can produce NaNs.
-        #        ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
+        if (
+            attention_bias is not None
+            or attention_mask is not None
+            or self.config.alibi
+            # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
+            # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
+            # scores correctly.
+            or past_key_values is not None
+        ):
+            if attention_bias is None and self.config.alibi:
+                attention_bias = get_causal_attention_bias(
+                    self.__cache, past_length + seq_len, x.device
+                ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
+            elif attention_bias is None:
+                attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
+            elif attention_bias.dtype in (torch.int8, torch.bool):
+                attention_bias = attention_bias.to(dtype=torch.float)
+                attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
 
-        attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] #if use_cache else None
+            # Transform to the right shape and data type.
+            mask_len = seq_len
+            if attention_mask is not None:
+                mask_len = attention_mask.shape[-1]
+            elif past_key_values is not None:
+                mask_len = past_key_values[0][0].shape[-2] + seq_len
+            attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
+
+            # Add in the masking bias.
+            if attention_mask is not None:
+                attention_bias = attention_bias + attention_mask
+                # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
+                # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
+                # it can produce NaNs.
+                ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
+
+        attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
         # decoder layers
         all_hidden_states = []
@@ -1518,8 +1290,7 @@ class LLaDAModel(nn.Module):
                     # add hidden states
                     all_hidden_states.append(x)
 
-                layer_past = None if past_query_key_values is None or not use_cache else past_query_key_values[0][block_idx]
-                transfer_idx = past_query_key_values[1] if past_query_key_values is not None else None
+                layer_past = None if past_key_values is None else past_key_values[block_idx]
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                     or (
@@ -1537,19 +1308,13 @@ class LLaDAModel(nn.Module):
                 ):
                     # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, 
-                        layer_past=layer_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache, 
-                        block_idx=block_idx
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(
-                        x, attention_bias=attention_bias, 
-                        layer_past=layer_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache,
-                        block_idx=block_idx
-                    )
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
                 if attn_key_values is not None:
-                    #assert cache is not None
+                    assert cache is not None
                     attn_key_values.append(cache)
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
@@ -1559,14 +1324,13 @@ class LLaDAModel(nn.Module):
 
                 layers_past = (
                     None
-                    if past_query_key_values is None
-                    else past_query_key_values[
+                    if past_key_values is None
+                    else past_key_values[
                         group_idx * self.config.block_group_size : (group_idx + 1) * self.config.block_group_size
                     ]
                 )
                 x, cache = block_group(
-                    x, attention_bias=attention_bias, 
-                    layers_past=layers_past, transfer_idx=transfer_idx, use_cache=use_cache, preprocess_cache=preprocess_cache,
+                    x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache
                 )
                 if attn_key_values is not None:
                     assert cache is not None
@@ -1628,34 +1392,19 @@ class LLaDAModelLM(PreTrainedModel):
         else:
             self.model = model
 
-        self._q_cache, self._kv_cache = False, False
-
-    def get_pos_rotary_embedding_cache(self, transfer_idx):
-        self.model.get_pos_rotary_embedding_cache(transfer_idx)
-
-    def reset_pos_rotary_embedding_cache(self):
-        self.model.reset_pos_rotary_embedding_cache()
-
-    def set_qkv_cache(self, q_cache: bool, kv_cache: bool):
-        self._q_cache = q_cache
-        self._kv_cache = kv_cache
-
-        self.model.set_qkv_cache(q_cache, kv_cache)
-
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
-        past_query_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
-        preprocess_cache: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1671,9 +1420,8 @@ class LLaDAModelLM(PreTrainedModel):
             input_embeddings=inputs_embeds,
             attention_mask=attention_mask,
             attention_bias=attention_bias,
-            past_query_key_values=past_query_key_values,
+            past_key_values=past_key_values,
             use_cache=use_cache,
-            preprocess_cache=preprocess_cache,
             output_hidden_states=output_hidden_states,
         )
 
@@ -1700,15 +1448,14 @@ class LLaDAModelLM(PreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple]] = None, **kwargs
     ):
-        pass
-        #if past_key_values:
-        #    # This is because we want the model to only process the last generated token.
-        #    input_ids = input_ids[:, -1:]
-        #model_inputs = {"input_ids": input_ids, "past_key_values": past_key_values}
-#
-        #model_inputs.update(kwargs)
-        #model_inputs["use_cache"] = kwargs.pop("use_cache", self.config.use_cache)
-        #return model_inputs
+        if past_key_values:
+            # This is because we want the model to only process the last generated token.
+            input_ids = input_ids[:, -1:]
+        model_inputs = {"input_ids": input_ids, "past_key_values": past_key_values}
+
+        model_inputs.update(kwargs)
+        model_inputs["use_cache"] = kwargs.pop("use_cache", self.config.use_cache)
+        return model_inputs
 
     # TODO: these are required to make the implementation complete.
     # def resize_position_embeddings(self, new_num_position_embeddings: int):
