@@ -24,6 +24,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefill", action="store_true", help="use dkv-cache-prefill")
     parser.add_argument("--decode", action="store_true", help="use dkv-cache-decode")
     parser.add_argument("--pd", action="store_true", help="use dkv-cache-pd")
+    parser.add_argument("--conv", action="store_true", help="use dkv-cache-conv")
+    
 
     parser.add_argument("--cache-steps", type=int, default=0, help="number of steps to cache")
     args = parser.parse_args()
@@ -35,6 +37,9 @@ if __name__ == "__main__":
         model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     elif args.pd:
         from models.modeling_dream_pd import DreamModel
+        model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
+    elif args.conv:
+        from models.modeling_dream_conv import DreamModel
         model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     else:
         model = AutoModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
@@ -51,36 +56,38 @@ if __name__ == "__main__":
 
 
     messages = [[
-        {
-            "role": "user", 
-            "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_1
-        }
-    ], [
+    #     {
+    #         "role": "user", 
+    #         "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_1
+    #     }
+    # ]
+    # ], [
         {
             "role": "user", 
             "content": question_2
         }
-    ], [
-        {
-            "role": "user", 
-            "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_3
-        }
-    ], [
-        {
-            "role": "user",
-            "content": question_4
-        }
-    ], [
-        {
-            "role": "user",
-            "content": question_5
-        }
-    ], [
-        {
-            "role": "user",
-            "content": question_6
-        }
     ]
+    # ], [
+    #     {
+    #         "role": "user", 
+    #         "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_3
+    #     }
+    # ], [
+    #     {
+    #         "role": "user",
+    #         "content": question_4
+    #     }
+    # ], [
+    #     {
+    #         "role": "user",
+    #         "content": question_5
+    #     }
+    # ], [
+    #     {
+    #         "role": "user",
+    #         "content": question_6
+    #     }
+    # ]
     
     ]
     prompts = tokenizer.apply_chat_template(
@@ -89,6 +96,7 @@ if __name__ == "__main__":
     prompt_ids = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
     input_ids = prompt_ids.input_ids.to(device="cuda")
     attention_mask = prompt_ids.attention_mask.to(device="cuda")
+    
    
     output = model.diffusion_generate(
         input_ids,
@@ -101,8 +109,8 @@ if __name__ == "__main__":
         top_p=0.95,
         alg=args.sampling_alg,
         alg_temp=0.,
-        use_cache=args.decode or args.prefill or args.pd,
-        cache_type="decoded" if args.decode else "prefill" if args.prefill else "pd",
+        use_cache=args.decode or args.prefill or args.pd or args.conv,
+        cache_type="conv",
         cache_steps=args.cache_steps,
         shift_type="un"
     )

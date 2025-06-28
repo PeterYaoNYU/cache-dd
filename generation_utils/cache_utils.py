@@ -15,6 +15,134 @@ from transformers.cache_utils import (
 )
 
 
+class ConvCache(Cache):
+    def __init__(self, num_hidden_layers: Optional[int] = None) -> None:
+        super().__init__()
+        self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+        self.num_hidden_layers = num_hidden_layers
+
+        self._transfer_order = None
+
+        #print("Init Dynamic cache")
+
+    def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
+        """
+        Support for backwards-compatible `past_key_value` indexing, e.g. `past_key_value[0][0].shape[2]` to get the
+        sequence length.
+        """
+        if layer_idx < len(self):
+            return (self.key_cache[layer_idx], self.value_cache[layer_idx])
+        else:
+            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+        
+    def __iter__(self):
+        """
+        Support for backwards-compatible `past_key_value` iteration, e.g. `for x in past_key_value:` to iterate over
+        keys and values
+        """
+        for layer_idx in range(len(self)):
+            yield (self.key_cache[layer_idx], self.value_cache[layer_idx])
+
+    def __len__(self):
+        """
+        Support for backwards-compatible `past_key_value` length, e.g. `len(past_key_value)`. This value corresponds
+        to the number of layers in the model.
+        """
+        return len(self.key_cache)
+    
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or not self.key_cache[layer_idx].numel()  # the layer has no cache
+        )
+        layer_seq_length = self.key_cache[layer_idx].shape[-2] if not is_empty_layer else 0
+        return layer_seq_length
+    
+    def is_empty(self) -> bool:
+        return len(self.key_cache) < self.num_hidden_layers or len(self.value_cache) < self.num_hidden_layers
+    
+    def refresh_cache(self) -> None:
+        self.key_cache = []
+        self.value_cache = []
+        #print("Refresh Cache. New Cache size:", len(self.key_cache), len(self.value_cache))
+
+    def get_transfer_cache(self, layer_idx, cache_position, prv_cache_position):
+
+        if layer_idx > 0:
+            assert self._transfer_order is not None, "Transfer order is not set"
+            order = self._transfer_order
+
+            if layer_idx == self.num_hidden_layers - 1:
+                self._transfer_order = None
+            return order
+        else:
+            B = cache_position.shape[0]
+            #print()
+            current_order = torch.cat([
+                (~prv_cache_position).nonzero(as_tuple=True)[1].view(B, -1),
+                prv_cache_position.nonzero(as_tuple=True)[1].view(B, -1),
+            ], dim=-1)
+
+            #print(prv_cache_position.nonzero(as_tuple=True)[1].shape, cache_position.nonzero(as_tuple=True)[1].shape)
+            #print((~prv_cache_position).nonzero(as_tuple=True)[1].shape, (~cache_position).nonzero(as_tuple=True)[1].shape)
+
+            next_order = torch.cat([
+                (~cache_position).nonzero(as_tuple=True)[1].view(B, -1),
+                cache_position.nonzero(as_tuple=True)[1].view(B, -1),
+            ], dim=-1)
+            #print("next", next_order)
+            #print("current", current_order)
+
+            transfer_order = []
+            for b in range(B):
+                value_to_index = {v.item(): i for i, v in enumerate(current_order[b])}
+                indices = torch.tensor([value_to_index.get(v.item(), -1) for v in next_order[b]])
+                transfer_order.append(indices)
+            transfer_order = torch.stack(transfer_order, dim=0).to(cache_position.device)
+
+            self._transfer_order = transfer_order
+            return transfer_order
+
+    
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
+
+        Parameters:
+            key_states (`torch.Tensor`):
+                The new key states to cache.
+            value_states (`torch.Tensor`):
+                The new value states to cache.
+            layer_idx (`int`):
+                The index of the layer to cache the states for.
+            cache_kwargs (`Dict[str, Any]`, `optional`):
+                Additional arguments for the cache subclass. No additional arguments are used in `DynamicCache`.
+
+        Return:
+            A tuple containing the updated key and value states.
+        """
+        B, n_h, _, h_d = key_states.shape
+        prv_cache_position = cache_kwargs.get("prv_cache_position", None)
+        cache_position = cache_kwargs.get("cache_position", None)
+
+        self.key_cache.append(key_states)
+
+        self.value_cache.append(value_states)
+
+
+
+
 class PrefillCache(Cache):
     def __init__(self, num_hidden_layers: Optional[int] = None) -> None:
         super().__init__()

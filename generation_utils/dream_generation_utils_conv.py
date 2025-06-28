@@ -31,7 +31,7 @@ from transformers.utils import (
     logging,
 )
 
-from .cache_utils import PrefillCache, DynamicCache
+from .cache_utils import PrefillCache, DynamicCache, ConvCache
 
 logger = logging.get_logger(__name__)
 
@@ -150,6 +150,8 @@ class DreamGenerationConfig(GenerationConfig):
 
         # Validate the values of the attributes
         self.validate(is_init=True)
+        
+        # print("Use cache:", self.use_cache, "cache type:", self.cache_type, "cache steps:", self.cache_steps)
 
     def validate(self, is_init=False):
         pass
@@ -233,8 +235,26 @@ class DreamGenerationMixin:
         # priority: `generation_config` argument > `model.generation_config` (the default generation config)
         using_model_generation_config = False
         if generation_config is None:
+            print("generation config is none, Using model generation config")
             generation_config = DreamGenerationConfig.from_model_config(self.config)
             using_model_generation_config = True
+            
+        use_cache = kwargs.pop("use_cache", None)
+        if use_cache is not None:
+            generation_config.use_cache = use_cache
+        cache_type = kwargs.pop("cache_type", None)
+        if cache_type is not None:
+            generation_config.cache_type = cache_type
+        cache_steps = kwargs.pop("cache_steps", None)
+        if cache_steps is not None:
+            generation_config.cache_steps = cache_steps
+            
+        shift_type = kwargs.pop("shift_type", None)
+        if shift_type is not None:
+            generation_config.shift_type = shift_type
+            
+            
+        print(f"prepare_config: Using cache: {generation_config.use_cache}, cache type: {generation_config.cache_type}, cache steps: {generation_config.cache_steps}")
 
         # `torch.compile` can't compile `copy.deepcopy`, arguments in `kwargs` that are part of `generation_config`
         # will mutate the object with `.update`. As such, passing these arguments through `kwargs` is disabled -- an
@@ -359,6 +379,9 @@ class DreamGenerationMixin:
             input_ids=input_ids,
             attention_mask=attention_mask 
         )
+        
+        print("Input id shape:", input_ids.shape)
+        
 
         result = self._sample(
             input_ids,
@@ -390,17 +413,23 @@ class DreamGenerationMixin:
         temperature = generation_config.temperature
         top_p = generation_config.top_p
         top_k = generation_config.top_k
+        
+        print("Sample_: use_cache:", generation_config.use_cache,
+              "cache_type:", generation_config.cache_type,
+              "cache_steps:", generation_config.cache_steps,)
 
         histories = [] if (return_dict_in_generate and output_history) else None
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        print("x shape:", x.shape, "max_length:", max_length, "max_new_tokens:", generation_config.max_new_tokens)
         B, L = x.shape
         prompt_mask = (x != mask_token_id)
         #print("x shape:", x.shape, generation_config.max_length, generation_config.max_new_tokens)
 
         # Setting the cache position for prefill. Would need to be changed if use dynamic cache for decoding.
         if generation_config.use_cache:
+            print("Using cache....")
             if generation_config.cache_type == "prefill":
                 past_key_values = PrefillCache(self.config.num_hidden_layers)
 
@@ -408,12 +437,13 @@ class DreamGenerationMixin:
                 cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
             
                 prv_cache_position = None
-            elif generation_config.cache_type == 'decoded':
-                past_key_values = DynamicCache(self.config.num_hidden_layers)
+            elif generation_config.cache_type == 'decoded' or generation_config.cache_type == 'conv':
+                past_key_values = ConvCache(self.config.num_hidden_layers)
                 cache_position = ~(x == mask_token_id)
                 cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
                 prv_cache_position = None
             else:
+                print(f"Using cache type: {generation_config.cache_type}")
                 raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
         else:
             past_key_values = None
@@ -421,7 +451,7 @@ class DreamGenerationMixin:
             prv_cache_position = None
        
         if attention_mask is not None and torch.any(attention_mask == 0.0):
-            print("attention_mask is not None ")
+            print("attention mask is NOT none")
             # we do not mask the [MASK] tokens so value = 1.0
             attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
             tok_idx = attention_mask.long().cumsum(-1) - 1
@@ -433,7 +463,8 @@ class DreamGenerationMixin:
                 attention_mask.unsqueeze(1).unsqueeze(-1),
             )
         else:
-            print("attention_mask is None")
+            print("attention mask is none")
+            
             tok_idx = torch.arange(
                 max_length, device=input_ids.device
             ).unsqueeze(0).repeat(input_ids.shape[0], 1)
@@ -456,7 +487,7 @@ class DreamGenerationMixin:
             else:
                 if generation_config.cache_type == "prefill":
                     pass
-                elif generation_config.cache_type == "decoded":
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "conv":
                     if i % generation_config.cache_steps == 0:
                         prv_cache_position = None
                         past_key_values.refresh_cache()
@@ -465,10 +496,11 @@ class DreamGenerationMixin:
                 
             total_tokens += (x.shape[1] * x.shape[0])
             if generation_config.use_cache and prv_cache_position is not None:
-                step_x = x[~prv_cache_position].view(x.shape[0], -1)
+                step_x = x
 
                 # reorder attention mask
                 if attention_mask != "full":
+                    print("WARNING: Reordering attention mask")
                     att_mask_reorder = torch.cat([
                         attention_mask[~prv_cache_position].view(x.shape[0], -1),
                         attention_mask[prv_cache_position].view(x.shape[0], -1),
@@ -487,8 +519,6 @@ class DreamGenerationMixin:
                 step_x = x
                 cur_attention_mask = ori_attention_mask
             run_tokens += (step_x.shape[1] * step_x.shape[0])
-            
-            print("prv cache position:", prv_cache_position)
 
             logits = self(
                 input_ids=step_x, 
@@ -497,19 +527,9 @@ class DreamGenerationMixin:
                 use_cache=generation_config.use_cache,
                 cache_position=cache_position,
                 prv_cache_position=prv_cache_position,
-                past_key_values=past_key_values
+                past_key_values=past_key_values, 
+                cache_reuse_mask=prv_cache_position
             ).logits
-
-            if logits.shape[1] < L:
-                
-                all_logits = torch.full((B, L, logits.shape[2]), -torch.inf, device=self.device, dtype=logits.dtype)
-                #print(all_logits.shape, (~prv_cache_position).shape, (~prv_cache_position).unsqueeze(-1).expand_as(all_logits).shape )
-                if B > 1:
-                    index = (~prv_cache_position).nonzero(as_tuple=True)[1].view(B, -1, 1).expand(B, -1, logits.shape[2])
-                    all_logits.scatter_(1, index,logits)
-                else:
-                    all_logits[~prv_cache_position] = logits
-                logits = all_logits
 
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
@@ -565,7 +585,7 @@ class DreamGenerationMixin:
                     if prv_cache_position is None:
                         prv_cache_position = cache_position
                         cache_position = None  
-                elif generation_config.cache_type == "decoded":
+                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "conv":
                     prv_cache_position = cache_position
                     #print(generation_config.cache_type, generation_config.shift_type, generation_config.cache_steps)
                     if generation_config.shift_type == "un":

@@ -178,6 +178,8 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         remasking: Remasking strategy. 'low_confidence' or 'random'.
         mask_id: The toke id of [MASK] is 126336.
     '''
+    threshod = 0.8
+    
     B, L = prompt.shape
     # get the intial form, which is a batch of [MASK] tokens, except for the prompt. Which is cloned. 
     x = torch.full((B, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
@@ -211,9 +213,11 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
         
-        print("cache refresh step: ", cache_reloading_step)
+        print("cache refresh step: ", cache_reloading_step, " remasking strategy: ", remasking )
         
         future_cache_idx = None
+        
+        spec_index_to_verify = None
         
         for i in range(steps):
             mask_index = (x == mask_id)
@@ -249,6 +253,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                         future_cache = future_cache, 
                         idx_to_decode = decode_idx, 
                         cache_reuse_mask = cache_reuse_mask,
+                        # spec_index_to_verify = spec_index_to_verify,
                     )
                     
                     if hasattr(model, "module"):
@@ -266,6 +271,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                         future_cache = future_cache, 
                         idx_to_decode = decode_idx, 
                         cache_reuse_mask = cache_reuse_mask,
+                        # spec_index_to_verify = spec_index_to_verify,
                     )
                     
                     # decode_idx = decode_idx + 1
@@ -285,8 +291,10 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 
                 # print("step: ", i, "pask _qkv shape", past_qkv[0][0].shape if past_qkv[0] is not None else None)
 
+            # print("Step: ", i, "logits shape: ", logits.shape, " decode idx: ", decode_idx)
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature) # b, l, D
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+            x0 = torch.where(mask_index, x0, x)
 
             if remasking == 'low_confidence':
                 p = F.softmax(logits.to(torch.float64), dim=-1) # B L V
@@ -295,7 +303,9 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             elif remasking == 'random':
                 x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
             elif remasking == 'ar' or 'convolution':
-                x0_p = torch.zeros_like(x0, dtype=torch.float64, device=x0.device)
+                p = F.softmax(logits.to(torch.float64), dim=-1) # B L V
+                x0_p = torch.squeeze(
+                    torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             else:
                 raise NotImplementedError(remasking)
 
@@ -318,8 +328,18 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 
             # Keep the predictions from x0 only where the token was masked, 
             # and preserve the original input x elsewhere (like prompt tokens).
-            x0 = torch.where(mask_index, x0, x)
+            # x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, -np.inf)
+            
+            if spec_index_to_verify is not None:
+                x0_spec_verify = x0[spec_index_to_verify]
+                confidence_spec_verify = x0_p[spec_index_to_verify]
+                # print("x0 spec verify: ", x0_spec_verify, " x0 spec verify shape: ", x0_spec_verify.shape)
+                print("Step: ", i-1 , "confidence spec verify: ", confidence_spec_verify, " confidence spec verify shape: ", confidence_spec_verify.shape)
+                bad_token_idx = confidence_spec_verify < threshod
+
+                print("Step: ", i, " bad token idx: ", bad_token_idx)
+                # print("Low confidence mask: ", low_conf_mask)
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             select_index = decode_idx.clone().to(x0.device)
@@ -333,8 +353,10 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 else:
                     _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                 transfer_index[j, select_index] = True
+                print("Step: ", i , "select idx confidence: ", confidence[j, select_index], " decode idx: ", decode_idx[j])
             
             decode_idx = decode_idx + 1
+            
             
             
             x[transfer_index] = x0[transfer_index] 
@@ -342,6 +364,8 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             fix_remove = False
             if fix_remove:
                 all_transfer_index = all_transfer_index & (~special_index)
+                
+            spec_index_to_verify = transfer_index.clone()
 
             # TODO: check if prv-transfer-idx and cur-transfer-idx work at the final order of the sequence
             # So prv_transfer_idx stores a snapshot of which tokens were already generated before this step, 
@@ -359,7 +383,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
 
 
 def main():
-    device = 'cuda:1'
+    device = 'cuda:0'
 
     model = LLaDAModelLM.from_pretrained(
         'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16,
@@ -369,7 +393,7 @@ def main():
 
     prompt = [
         "John plans to sell some of his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have after selling and buying?",
-    ] * 8
+    ]
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
     m = [[{"role": "user", "content": "Please answer the question step by step and put the answer in \\boxed{}." + p}] for p in prompt]

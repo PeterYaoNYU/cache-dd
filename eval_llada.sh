@@ -35,29 +35,31 @@ export HF_DATASETS_TRUST_REMOTE_CODE=true
 # accelerate launch eval_llada.py --tasks minerva_math --model llada_dist --model_args model_path='GSAI-ML/LLaDA-8B-Base',gen_length=1024,steps=1024,block_length=1024
 
 # accelerate launch eval_llada.py --tasks humaneval --model llada_dist --confirm_run_unsafe_code --model_args model_path='GSAI-ML/LLaDA-8B-Base',gen_length=1024,steps=1024,block_length=1024
-export CUDA_VISIBLE_DEVICES=6,7
+# export CUDA_VISIBLE_DEVICES=6,7
 
-output_path=evals_results/mbpp-ns3-conv/
+# output_path=evals_results/mbpp-ns3-conv/
 
-CUDA_VISIBLE_DEVICES=1,6,7 accelerate launch --main_process_port 29511 eval_llada.py \
-    --tasks mbpp --model llada_dist \
-    --confirm_run_unsafe_code\
-    --batch_size 1 \
-    --output_path $output_path \
-    --log_samples \
-    --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=512,steps=128,block_length=512,remasking="convolution",cache_reload_step=4,enable_cache=True,
+# CUDA_VISIBLE_DEVICES=1,6,7 accelerate launch --main_process_port 29511 eval_llada.py \
+#     --tasks humaneval --model llada_dist \
+#     --confirm_run_unsafe_code\
+#     --batch_size 1 \
+#     --output_path $output_path \
+#     --log_samples \
+#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=512,steps=128,block_length=512,remasking="convolution",cache_reload_step=4,enable_cache=True,
 
 
 # export CUDA_VISIBLE_DEVICES=6,7
 
-# output_path=evals_results/mbpp-ns3-conv-math
+output_path=evals_results/mbpp-ns3-conv-math-zero-shot-full/
 
-# CUDA_VISIBLE_DEVICES=0,1,6,7 accelerate launch --main_process_port 29511 eval_llada.py \
-#     --tasks gsm8k --model llada_dist \
-#     --batch_size 1 \
-#     --output_path $output_path \
-#     --log_samples \
-#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=128,block_length=256,remasking="convolution",cache_reload_step=4,enable_cache=True,
+CUDA_VISIBLE_DEVICES=3,4,5,6,7 accelerate launch --main_process_port 29511 eval_llada_original.py \
+    --tasks gsm8k --model llada_dist \
+    --batch_size 1 \
+    --output_path $output_path \
+    --log_samples \
+    --num_fewshot 0 \
+    --limit 100 \
+    --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=256,remasking="low_confidence",
 
 # CUDA_VISIBLE_DEVICES=0,1,6,7 accelerate launch --main_process_port 29511 eval_llada.py \
 #     --tasks minerva_math --model llada_dist \
@@ -65,7 +67,7 @@ CUDA_VISIBLE_DEVICES=1,6,7 accelerate launch --main_process_port 29511 eval_llad
 #     --output_path $output_path \
 #     --log_samples \
 #     --limit 150 \
-#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=128,block_length=256,remasking="convolution",cache_reload_step=4,enable_cache=True,
+#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=256,remasking="convolution",cache_reload_step=4,enable_cache=True,
 
 
 # for cache_reload_step in 8 16; do

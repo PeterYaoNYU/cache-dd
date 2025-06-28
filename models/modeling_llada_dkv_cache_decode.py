@@ -1034,14 +1034,16 @@ class LLaDALlamaBlock(LLaDABlock):
 
         # in a refresh step
         if preprocess_cache and not use_cache:
-            #if block_idx == 31:
-            #   print("In preprocess_cache", transfer_idx[1])
-            cache_position = transfer_idx[1] # for current transfer idx
-            cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
-            past_k = k[cache_position].view(B, -1, D)
-            past_v = v[cache_position].view(B, -1, D)
-            assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
-            cache = (past_k, past_v)
+            with record_function("kv_refresh"):
+            
+                #if block_idx == 31:
+                #   print("In preprocess_cache", transfer_idx[1])
+                cache_position = transfer_idx[1] # for current transfer idx
+                cache_position = cache_position.unsqueeze(-1).expand(B, -1, D)
+                past_k = k[cache_position].view(B, -1, D)
+                past_v = v[cache_position].view(B, -1, D)
+                assert past_k.shape[1] * B == transfer_idx[1].sum(), f"past k shape: {past_k.shape}, B: {B}, Cache Sum: {transfer_idx[1].sum()}"
+                cache = (past_k, past_v)
         # in a KV reuse step. 
         elif preprocess_cache and use_cache:
             #prv_transfer, cur_transfer = transfer_idx # for current transfer idx
@@ -1056,7 +1058,7 @@ class LLaDALlamaBlock(LLaDABlock):
             #past_k.scatter_(1, reorder_token_idx, all_past_k).scatter_(1, reorder_token_idx, new_past_k)
             #print(cur_remain_cache_position)
             #exit()
-            with record_function("scatter_reorder"):
+            with record_function("kv_scatter_reorder"):
                 prv_transfer, cur_transfer = transfer_idx
                 prv_cache_position = torch.nonzero(prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)
                 prv_not_cache_position = torch.nonzero(~prv_transfer, as_tuple=True)[1].view(prv_transfer.shape[0], -1)

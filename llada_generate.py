@@ -20,12 +20,12 @@ def set_random_seed(seed):
 
 def parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--steps", type=int, default=128)
-    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--cfg", type=float, default=0.0)
 
-    parser.add_argument("--sampling-alg", type=str, default="low_confidence")
+    parser.add_argument("--sampling-alg", type=str, default="convolution")
     parser.add_argument("--cache-steps", type=int, default=2)
 
     parser.add_argument("--origin", action="store_true")
@@ -34,6 +34,8 @@ def parser():
     parser.add_argument("--future", action="store_true")
     parser.add_argument("--future-simple", action="store_true")
     parser.add_argument("--selective_conv", action="store_true")
+    parser.add_argument("--spec-conv", action="store_true")
+    
     
     
 
@@ -66,6 +68,9 @@ def main():
     elif args.selective_conv:
         from models.modeling_llada_selective import LLaDAModelLM
         from generation_utils.llada_cache_selective import generate
+    elif args.spec_conv:
+        from models.modeling_llada_cache_conv import LLaDAModelLM
+        from generation_utils.llada_conv_speculative import generate
     else:
         raise NotImplementedError
 
@@ -97,7 +102,7 @@ def main():
 
     out = generate(
         model, tokenizer, input_ids, 
-        steps=args.seq_len, gen_length=args.steps, block_length=args.block_size, 
+        steps=args.steps, gen_length=args.seq_len, block_length=args.block_size, 
         temperature=0., cfg_scale=0., 
         remasking=args.sampling_alg,
         enable_cache=not args.origin,
