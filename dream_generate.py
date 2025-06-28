@@ -16,10 +16,10 @@ def set_random_seed(seed):
 if __name__ == "__main__":
     # parser
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--steps", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=256)
 
-    parser.add_argument("--sampling-alg", type=str, default='maskgit_plus')
+    parser.add_argument("--sampling-alg", type=str, default='conv')
 
     parser.add_argument("--prefill", action="store_true", help="use dkv-cache-prefill")
     parser.add_argument("--decode", action="store_true", help="use dkv-cache-decode")
@@ -56,17 +56,17 @@ if __name__ == "__main__":
 
 
     messages = [[
-    #     {
-    #         "role": "user", 
-    #         "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_1
-    #     }
-    # ]
-    # ], [
         {
             "role": "user", 
-            "content": question_2
+            "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_1
         }
     ]
+    # ], [
+    #     {
+    #         "role": "user", 
+    #         "content": question_2
+    #     }
+    # ]
     # ], [
     #     {
     #         "role": "user", 

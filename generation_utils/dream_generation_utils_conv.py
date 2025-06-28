@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+NUM_BLOCKS = 4
+RADIUS = 16
+
 import warnings
 import copy
 from dataclasses import dataclass
@@ -34,6 +37,72 @@ from transformers.utils import (
 from .cache_utils import PrefillCache, DynamicCache, ConvCache
 
 logger = logging.get_logger(__name__)
+
+
+def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
+    B = x.shape[0]
+    L = x.shape[1]
+    
+    # storing the index of the start of each block in a tensor.
+    starts = torch.empty((B, num_blocks), dtype=torch.long, device=x.device)
+    
+    remaining = L - start
+    base, rem = divmod(remaining, num_blocks)
+
+    sizes = torch.tensor(
+        [base+1] * rem + [base] * (num_blocks - rem),
+        device=x.device, dtype=torch.long, 
+    )
+    
+    print("Block sizes:", sizes, "num_blocks:", num_blocks, "start:", start)
+        
+    starts_row = torch.cat((
+        torch.zeros(1, device=x.device, dtype=torch.long),
+        torch.cumsum(sizes, 0)
+    ))[:-1]  
+    
+    starts = starts_row.expand(B, -1).clone()
+    starts += start
+    
+    # print("Block starts, ", block_starts)
+    return starts
+        
+        
+        
+def block_far_mask(block_start_idx: torch.Tensor, L: int, radius: int = 16) -> torch.BoolTensor:
+    """
+    Parameters
+    ----------
+    block_start_idx : (B, num_blocks)
+        Start indices of blocks per sample.
+    L : int
+        Sequence length.
+    radius : int
+        Distance threshold from block start positions.
+
+    Returns
+    -------
+    mask : (B, L) BoolTensor
+        True where token is NOT within `radius` of any block start.
+    """
+    B, num_blocks = block_start_idx.shape
+
+    # shape: (1, L)
+    positions = torch.arange(L, device=block_start_idx.device).unsqueeze(0)
+
+    # shape: (B, L, num_blocks) ← broadcast subtraction
+    dist = (positions.unsqueeze(-1) - block_start_idx.unsqueeze(1)).abs()
+    
+
+    # shape: (B, L): is there *any* start within radius?
+    is_near_any_block = (dist < radius).any(dim=-1)
+    
+    # print("Block starts:", block_start_idx, "dist: ", dist, " is near any block:", is_near_any_block)
+    
+
+    # invert to get final mask: True if it's *not* near any block start
+    mask = ~is_near_any_block
+    return mask
 
 
 def top_p_logits(logits, top_p=None):
@@ -151,6 +220,7 @@ class DreamGenerationConfig(GenerationConfig):
         # Validate the values of the attributes
         self.validate(is_init=True)
         
+        
         # print("Use cache:", self.use_cache, "cache type:", self.cache_type, "cache steps:", self.cache_steps)
 
     def validate(self, is_init=False):
@@ -252,6 +322,11 @@ class DreamGenerationMixin:
         shift_type = kwargs.pop("shift_type", None)
         if shift_type is not None:
             generation_config.shift_type = shift_type
+            
+            
+        alg = kwargs.pop("alg", None)
+        if alg is not None:
+            generation_config.alg = alg
             
             
         print(f"prepare_config: Using cache: {generation_config.use_cache}, cache type: {generation_config.cache_type}, cache steps: {generation_config.cache_steps}")
@@ -382,6 +457,9 @@ class DreamGenerationMixin:
         
         print("Input id shape:", input_ids.shape)
         
+        print("mask token id ", generation_config.mask_token_id, " eos token id: ", generation_config.eos_token_id, " pad token id: ", generation_config.pad_token_id)
+        print("bos token id ", generation_config.bos_token_id,)
+        
 
         result = self._sample(
             input_ids,
@@ -422,7 +500,7 @@ class DreamGenerationMixin:
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
-        print("x shape:", x.shape, "max_length:", max_length, "max_new_tokens:", generation_config.max_new_tokens)
+        # print("x shape:", x.shape, "max_length:", max_length, "max_new_tokens:", generation_config.max_new_tokens)
         B, L = x.shape
         prompt_mask = (x != mask_token_id)
         #print("x shape:", x.shape, generation_config.max_length, generation_config.max_new_tokens)
@@ -474,13 +552,23 @@ class DreamGenerationMixin:
             #print("In Full:", attention_mask)
 
         timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+        
+        print("prompt len: ", input_ids.shape[1], "max_length:", max_length, )
+        
+        decode_idx = block_starts(x, num_blocks=NUM_BLOCKS, start=input_ids.shape[1])
+        print("decode_idx:", decode_idx)
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
         
         total_tokens, run_tokens = 0, 0
-        for i in range(steps):
+        for i in range(steps//NUM_BLOCKS):
+            # print(f"Step {i} of {steps}, decode_idx: {decode_idx}")
             mask_index = (x == mask_token_id)
+            
+            cache_reuse_mask = block_far_mask(decode_idx, x.shape[1], radius=RADIUS)
+            # print("cache_reuse_mask:", cache_reuse_mask)
+            # print("decode_idx:", decode_idx)
 
             if not generation_config.use_cache:
                 cache_position, prv_cache_position = None, None    
@@ -528,7 +616,7 @@ class DreamGenerationMixin:
                 cache_position=cache_position,
                 prv_cache_position=prv_cache_position,
                 past_key_values=past_key_values, 
-                cache_reuse_mask=prv_cache_position
+                cache_reuse_mask=cache_reuse_mask,
             ).logits
 
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
@@ -539,8 +627,24 @@ class DreamGenerationMixin:
             mask_logits = logits[mask_index]
             t = timesteps[i]
             s = timesteps[i + 1]
-
-            if alg == 'origin':
+            
+            # print("decoding alg is: ", alg)
+            
+            
+            transfer_idx = torch.zeros_like(x, device=self.device, dtype=torch.bool)
+            for j in range(x.shape[0]):
+                if alg == 'conv':
+                    transfer_idx[j, decode_idx] = True
+            
+            # print(f"Step {i} transfer_idx: {transfer_idx}")
+            
+            if alg == 'conv':
+                # print("logits[transfer_idx]:", logits[transfer_idx])
+                x0_p, x0 = sample_tokens(logits[transfer_idx], temperature=temperature, top_p=top_p, top_k=top_k)  
+                # print("done sample tokens, x0_p:", x0_p, "x0:", x0)
+                x[transfer_idx] = x0.clone()
+                # print(f"Step {i} conv: x: {x},\n x0: {x0}")
+            elif alg == 'origin':
                 p_transfer = 1 - s / t if i < steps - 1 else 1
                 x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
                 transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
@@ -577,6 +681,8 @@ class DreamGenerationMixin:
             #print(f"Step {i}:", x)
             if histories is not None:
                 histories.append(x.clone())
+                
+            decode_idx = decode_idx + 1
 
             if generation_config.use_cache:
 

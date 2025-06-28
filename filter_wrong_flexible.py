@@ -32,12 +32,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def is_wrong(obj: dict) -> bool:
+    # print(obj.keys())
     """True if the record is marked wrong by any known field."""
     # Newer harness versions use `exact_match`; very old ones use `is_correct`.
     if "exact_match" in obj:
         return float(obj["exact_match"]) == 0.0
     if "is_correct" in obj:        # fallback for older runs
         return obj["is_correct"] is False
+    if "pass_at_1" in obj:
+        # print(f"Warning: 'pass_at_1' field found")
+        return float(obj["pass_at_1"]) == 0.0
     # If neither field exists, assume unknown → not counted.
     return False
 
@@ -50,8 +54,9 @@ def main() -> None:
             for line in fh:
                 obj = json.loads(line)
                 if (
-                    obj.get("filter") == "flexible-extract"
-                    and is_wrong(obj)
+                    # obj.get("filter") == "flexible-extract"
+                    # and is_wrong(obj)
+                    is_wrong(obj)
                 ):
                     # Emit the original line verbatim (keeps hashing fields intact)
                     sys.stdout.write(line)
