@@ -1,8 +1,14 @@
 
-tasks="mbpp"
-nshots="3"
-lengths="512"
-temperatures="0.2"
+# tasks="mbpp"
+# nshots="3"
+# lengths="512"
+# temperatures="0.2"
+
+
+tasks="gsm8k"
+nshots="8"
+lengths="256"
+temperatures="0"
 
 model=Dream-org/Dream-v0-Base-7B
 # Create arrays from space-separated strings
@@ -39,11 +45,12 @@ export HF_ALLOW_CODE_EVAL=1
 for i in "${!TASKS_ARRAY[@]}"; do
     output_path=evals_results/${TASKS_ARRAY[$i]}-ns${NSHOTS_ARRAY[$i]}
     echo "Task: ${TASKS_ARRAY[$i]}, Shots: ${NSHOTS_ARRAY[$i]}; Output: $output_path"
-    CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 accelerate launch eval_dream.py --model dream \
+    CUDA_VISIBLE_DEVICES=1 accelerate launch eval_dream.py --model dream \
         --model_args pretrained=${model},max_new_tokens=${LENGTH_ARRAY[$i]},diffusion_steps=${LENGTH_ARRAY[$i]},add_bos_token=true,temperature=${TEMP_ARRAY[$i]},top_p=0.95,use_cache=true,cache_type="decoded",cache_steps=4,shift_type="un",alg='conv' \
         --tasks ${TASKS_ARRAY[$i]} \
         --num_fewshot ${NSHOTS_ARRAY[$i]} \
         --batch_size 1 \
+        --limit 5 \
         --output_path $output_path \
         --log_samples \
         --confirm_run_unsafe_code

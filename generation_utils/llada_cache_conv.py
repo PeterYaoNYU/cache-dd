@@ -10,6 +10,8 @@ from models.modeling_llada_cache_conv import LLaDAModelLM
 
 import time
 
+N_PARALLEL=1
+
 
 def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
     B = x.shape[0]
@@ -201,7 +203,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
     
     print("Prompt length: ", prompt.shape[1], " Gen length: ", gen_length)
     
-    decode_idx = block_starts(x, 2, L)
+    decode_idx = block_starts(x, N_PARALLEL, L)
     
     for num_block in range(num_blocks):
         past_qkv = None
@@ -217,6 +219,8 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         
         for i in range(steps):
             mask_index = (x == mask_id)
+            
+            # print(f"step {i} decode idx: ", decode_idx)
             if cur_transfer_index is not None:
             # still_masked = (input_ids == 126336) # [Mask] id
                 far_enough = torch.cumsum(~cur_transfer_index, dim=1) > 32
@@ -284,9 +288,17 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 prev_cache_idx = future_cache_idx
                 
                 # print("step: ", i, "pask _qkv shape", past_qkv[0][0].shape if past_qkv[0] is not None else None)
+                
+
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature) # b, l, D
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+            
+            
+            # # a cache reloading step:
+            # if i % cache_reloading_step == 0 and i > 1 and enable_cache:
+            #     unmasked_tokens = x0 != mask_id
+                
 
             if remasking == 'low_confidence':
                 p = F.softmax(logits.to(torch.float64), dim=-1) # B L V
@@ -369,7 +381,7 @@ def main():
 
     prompt = [
         "John plans to sell some of his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have after selling and buying?",
-    ] * 8
+    ] 
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
     m = [[{"role": "user", "content": "Please answer the question step by step and put the answer in \\boxed{}." + p}] for p in prompt]
@@ -389,7 +401,7 @@ def main():
     decoding_start_time = time.time()
     out = generate(
         model, tokenizer, input_ids, 
-        steps=32, gen_length=128, block_length=128, 
+        steps=256, gen_length=256, block_length=256, 
         temperature=0., cfg_scale=0., 
         remasking='convolution',
         enable_cache=False,

@@ -54,9 +54,9 @@ def main() -> None:
             for line in fh:
                 obj = json.loads(line)
                 if (
-                    # obj.get("filter") == "flexible-extract"
-                    # and is_wrong(obj)
-                    is_wrong(obj)
+                    obj.get("filter") == "flexible-extract"
+                    and is_wrong(obj)
+                    # is_wrong(obj)
                 ):
                     # Emit the original line verbatim (keeps hashing fields intact)
                     sys.stdout.write(line)

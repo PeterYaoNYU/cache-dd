@@ -405,11 +405,15 @@ class DreamSdpaAttention(DreamAttention):
             past_k, past_v = past_key_value[self.layer_idx][0], past_key_value[self.layer_idx][1]
             
             # print("Cache reuse mask:", mask.shape, " past_k:", past_k.shape, " past_v:", past_v.shape)
+            if self.layer_idx==1:
+                print("reusing cache:", past_k.shape, past_v.shape, " mask:", mask.shape)
             
             key_states = torch.where(mask, past_k, key_states)
             value_states = torch.where(mask, past_v, value_states)
             
         else:
+            if self.layer_idx==1:
+                print("Not reusing cache, using new key_states and value_states")
             k_len = q_len
             
         # print("cache_position:", cache_position, " prv_cache_position:", prv_cache_position)

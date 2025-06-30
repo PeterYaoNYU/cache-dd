@@ -19,10 +19,10 @@ from transformers import AutoTokenizer, AutoModel
 # from models.modeling_llada_selective import LLaDAModelLM
 # from generation_utils.llada_cache_selective import generate
 
-# from models.modeling_llada_cache_conv import LLaDAModelLM
-# from generation_utils.llada_cache_conv import generate
+from models.modeling_llada_cache_conv import LLaDAModelLM
+from generation_utils.llada_cache_conv import generate
 
-from generation_utils.llada_generate_original import generate
+# from generation_utils.llada_generate_original import generate
 
 
 def set_seed(seed):
@@ -83,8 +83,8 @@ class LLaDAEvalHarness(LM):
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        # self.model = LLaDAModelLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        self.model = LLaDAModelLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        # self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
         
         self.model.eval()
 

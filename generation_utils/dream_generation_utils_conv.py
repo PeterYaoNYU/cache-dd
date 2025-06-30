@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-NUM_BLOCKS = 4
+NUM_BLOCKS = 1
 RADIUS = 16
+
+THRESHOLD = 0.5
 
 import warnings
 import copy
@@ -37,6 +39,19 @@ from transformers.utils import (
 from .cache_utils import PrefillCache, DynamicCache, ConvCache
 
 logger = logging.get_logger(__name__)
+
+def add_gumbel_noise(logits, temperature):
+    '''
+    The Gumbel max is a method for sampling categorical distributions.
+    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
+    Thus, we use float64.
+    '''
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand_like(logits, dtype=torch.float64)
+    gumbel_noise = (- torch.log(noise)) ** temperature
+    return logits.exp() / gumbel_noise
 
 
 def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
@@ -497,6 +512,8 @@ class DreamGenerationMixin:
               "cache_steps:", generation_config.cache_steps,)
 
         histories = [] if (return_dict_in_generate and output_history) else None
+        
+        prompt_length = input_ids.shape[1]
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
@@ -561,6 +578,8 @@ class DreamGenerationMixin:
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
         
+        correction_flag = False
+        
         total_tokens, run_tokens = 0, 0
         for i in range(steps//NUM_BLOCKS):
             # print(f"Step {i} of {steps}, decode_idx: {decode_idx}")
@@ -570,18 +589,12 @@ class DreamGenerationMixin:
             # print("cache_reuse_mask:", cache_reuse_mask)
             # print("decode_idx:", decode_idx)
 
-            if not generation_config.use_cache:
-                cache_position, prv_cache_position = None, None    
-            else:
-                if generation_config.cache_type == "prefill":
-                    pass
-                elif generation_config.cache_type == "decoded" or generation_config.cache_type == "conv":
-                    if i % generation_config.cache_steps == 0:
-                        prv_cache_position = None
-                        past_key_values.refresh_cache()
-                else:
-                    raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
-                
+
+            if i % generation_config.cache_steps == 0:
+                print("refreshing cache at step", i)
+                prv_cache_position = None
+                past_key_values.refresh_cache()
+
             total_tokens += (x.shape[1] * x.shape[0])
             if generation_config.use_cache and prv_cache_position is not None:
                 step_x = x
@@ -624,6 +637,41 @@ class DreamGenerationMixin:
             # this allows user-defined logits control of the intermediate steps
             logits = generation_logits_hook_func(i, x, logits)
             
+            correction_flag = False
+            correction_indices = []
+            
+            
+            # if i > 0 and i % generation_config.cache_steps == 0:
+            #     # speculative verification
+            #     logits_with_noise = add_gumbel_noise(logits, temperature)
+            #     x0_verify = torch.argmax(logits_with_noise, dim=-1)
+            #     x0_verify = x0_verify[~mask_index]
+            #     p = F.softmax(logits.to(torch.float64), dim=-1)
+            #     x0_p_verify = torch.squeeze(
+            #         torch.gather(p, dim=-1, index=torch.unsqueeze(x, -1)), -1)[~mask_index][prompt_length:]
+            #     # print(f"Step {i} verify_token: ", x0_verify)
+            #     fail_mask = x0_p_verify < THRESHOLD
+            #     fail_indices = fail_mask.nonzero(as_tuple=True)[0]
+            #     fail_indices = fail_indices + prompt_length
+            #     # print(f"Step {i} fail indices: ", fail_indices)
+                
+            #     fail_idx = torch.zeros_like(x, device=self.device, dtype=torch.bool)
+            #     for j in range(x.shape[0]):
+            #             fail_idx[j, fail_indices] = True
+                
+            #     x0_p, x0 = sample_tokens(logits[fail_idx], temperature=temperature, top_p=top_p, top_k=top_k)
+                
+            #     # print("Shape of x0_p: ", x0_p.shape, "Shape of x0: ", x0.shape, " Shape of x0_verify: ", x0_verify.shape) 
+            #     # print("fail indices: ", fail_indices.shape)
+            #     for idx in range(fail_indices.shape[0]):
+            #         # print("Original token: ", x[0][idx], "prob: ", x0_p[idx], " new token: ", x0[idx])
+            #         if x[0][idx] != x0[idx]:
+            #             print("correcting token: ",  fail_indices[idx], ", token id ", x[0][idx], " with new token: ", x0[idx])
+            #             x[0][idx] = x0[idx]
+                
+                
+            
+            
             mask_logits = logits[mask_index]
             t = timesteps[i]
             s = timesteps[i + 1]
@@ -632,15 +680,20 @@ class DreamGenerationMixin:
             
             
             transfer_idx = torch.zeros_like(x, device=self.device, dtype=torch.bool)
+            # if not correction_flag:
             for j in range(x.shape[0]):
-                if alg == 'conv':
                     transfer_idx[j, decode_idx] = True
-            
+            # elif correction_flag and len(correction_indices) > 0:
+            #     for j in range(x.shape[0]):
+            #             transfer_idx[j, correction_indices] = True
+                        
+                
             # print(f"Step {i} transfer_idx: {transfer_idx}")
             
             if alg == 'conv':
                 # print("logits[transfer_idx]:", logits[transfer_idx])
                 x0_p, x0 = sample_tokens(logits[transfer_idx], temperature=temperature, top_p=top_p, top_k=top_k)  
+                # print(f"Step {i} sample tokens: x0_p: {x0_p}, x0: {x0}")
                 # print("done sample tokens, x0_p:", x0_p, "x0:", x0)
                 x[transfer_idx] = x0.clone()
                 # print(f"Step {i} conv: x: {x},\n x0: {x0}")
@@ -681,8 +734,10 @@ class DreamGenerationMixin:
             #print(f"Step {i}:", x)
             if histories is not None:
                 histories.append(x.clone())
+            
+            if not correction_flag:
+                decode_idx = decode_idx + 1
                 
-            decode_idx = decode_idx + 1
 
             if generation_config.use_cache:
 

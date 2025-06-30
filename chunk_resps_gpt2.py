@@ -81,6 +81,8 @@ def main() -> None:
                         [tok.decode(block, clean_up_tokenization_spaces=False)]
                         for block in token_blocks
                     ]
+                    
+                    blocks_len = [len(block) for block in token_blocks]
 
                     out_line = {
                         "doc_id": doc_id,
@@ -90,6 +92,7 @@ def main() -> None:
                         "blocks": text_blocks,
                         "answer": answer, 
                         "filtered_resp": filtered_resp,
+                        "blocks_len": blocks_len,
                     }
                     if not args.no_tokens:
                         out_line["token_blocks"] = token_blocks

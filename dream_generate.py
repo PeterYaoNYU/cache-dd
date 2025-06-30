@@ -58,7 +58,8 @@ if __name__ == "__main__":
     messages = [[
         {
             "role": "user", 
-            "content": "Answer the question step by step and put the answer in \\boxed\{\}: " + question_1
+            "content": "If Marcy works for the same company for 40 years, she gets an annual pension of $50,000/year. Starting after 20 years, she becomes entitled to 5% of the value of the pension per year. If she quits after 30 years, what will her annual pension be?"
+            # "content": "Mishka bought 3 pairs of shorts, 3 pairs of pants, and 3 pairs of shoes. One pair of shorts costs $16.50. One pair of pants costs $22.50 and one pair of shoes costs $42. How many dollars did Mishka spend on all the clothing items?"
         }
     ]
     # ], [
@@ -105,7 +106,7 @@ if __name__ == "__main__":
         output_history=True,
         return_dict_in_generate=True,
         steps=args.steps,
-        temperature=0.05,
+        temperature=0.0,
         top_p=0.95,
         alg=args.sampling_alg,
         alg_temp=0.,
