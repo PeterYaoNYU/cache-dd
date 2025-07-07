@@ -27,7 +27,7 @@ if __name__ == "__main__":
     parser.add_argument("--conv", action="store_true", help="use dkv-cache-conv")
     
 
-    parser.add_argument("--cache-steps", type=int, default=0, help="number of steps to cache")
+    parser.add_argument("--cache-steps", type=int, default=4, help="number of steps to cache")
     args = parser.parse_args()
 
     model_path = "Dream-org/Dream-v0-Instruct-7B"
@@ -42,7 +42,8 @@ if __name__ == "__main__":
         from models.modeling_dream_conv import DreamModel
         model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     else:
-        model = AutoModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
+        from models.modeling_dream_original import DreamModel
+        model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = model.to("cuda").eval()
@@ -111,7 +112,7 @@ if __name__ == "__main__":
         alg=args.sampling_alg,
         alg_temp=0.,
         use_cache=args.decode or args.prefill or args.pd or args.conv,
-        cache_type="conv",
+        cache_type="decoded",
         cache_steps=args.cache_steps,
         shift_type="un"
     )

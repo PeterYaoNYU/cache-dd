@@ -20,7 +20,7 @@ from transformers import AutoTokenizer, AutoModel
 # from generation_utils.llada_cache_selective import generate
 
 from models.modeling_llada_cache_conv import LLaDAModelLM
-from generation_utils.llada_cache_conv import generate
+from generation_utils.llada_conv_speculative import generate
 
 # from generation_utils.llada_generate_original import generate
 

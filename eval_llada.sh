@@ -50,24 +50,25 @@ export HF_DATASETS_TRUST_REMOTE_CODE=true
 
 # export CUDA_VISIBLE_DEVICES=6,7
 
-output_path=evals_results/gsm8k-llada-zero-shot
+output_path=evals_results/gsm8k-llada-zero-shot-baseline
 
-CUDA_VISIBLE_DEVICES=1,4,5,6,7 accelerate launch --main_process_port 29511 eval_llada_original.py \
-    --tasks gsm8k --model llada_dist \
-    --batch_size 1 \
-    --output_path $output_path \
-    --log_samples \
-    --num_fewshot 0 \
-    --limit 100 \
-    --model_args model_path='GSAI-ML/LLaDA-8B-Base',gen_length=256,steps=256,block_length=256,remasking="low_confidence",
-
-# CUDA_VISIBLE_DEVICES=1,4,5,6,7 accelerate launch --main_process_port 29511 eval_llada.py \
+# CUDA_VISIBLE_DEVICES=2,3,4,7 accelerate launch --main_process_port 29511 eval_llada_original.py \
 #     --tasks gsm8k --model llada_dist \
 #     --batch_size 1 \
 #     --output_path $output_path \
 #     --log_samples \
 #     --num_fewshot 0 \
-#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=256,remasking="convolution",cache_reload_step=4,enable_cache=True,
+#     --limit 100 \
+#     --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=32,remasking="low_confidence",
+
+CUDA_VISIBLE_DEVICES=1 accelerate launch --main_process_port 29511 eval_llada.py \
+    --tasks gsm8k --model llada_dist \
+    --batch_size 1 \
+    --output_path $output_path \
+    --log_samples \
+    --num_fewshot 0 \
+    --limit 200 \
+    --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=133,block_length=256,remasking="convolution",cache_reload_step=4,enable_cache=True,
 
 
 # for cache_reload_step in 8 16; do

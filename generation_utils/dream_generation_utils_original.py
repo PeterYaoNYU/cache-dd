@@ -31,8 +31,6 @@ from transformers.utils import (
     logging,
 )
 
-from .cache_utils import PrefillCache, DynamicCache
-
 logger = logging.get_logger(__name__)
 
 
@@ -96,7 +94,6 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
-    cache_ratio: Optional[float] = None
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -131,11 +128,6 @@ class DreamGenerationConfig(GenerationConfig):
         self._from_model_config = kwargs.pop("_from_model_config", False)
         self._commit_hash = kwargs.pop("_commit_hash", None)
         self.transformers_version = kwargs.pop("transformers_version", __version__)
-
-        self.use_cache = kwargs.pop("use_cache", False)
-        self.cache_type = kwargs.pop("cache_type", None)
-        self.cache_steps = kwargs.pop("cache_steps", 0)
-        self.shift_type = kwargs.pop("shift_type", None)
 
         # Additional attributes without default values
         if not self._from_model_config:
@@ -375,8 +367,7 @@ class DreamGenerationMixin:
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
-        generation_logits_hook_func,
-        **model_kwargs,
+        generation_logits_hook_func
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -392,149 +383,65 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
 
         histories = [] if (return_dict_in_generate and output_history) else None
+        
+        
+        sample_start_event = torch.cuda.Event(enable_timing=True)
+        sample_end_event = torch.cuda.Event(enable_timing=True)
+        sample_total_time_ms = 0.0
+        sample_count = 0
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
-        B, L = x.shape
-        prompt_mask = (x != mask_token_id)
-        #print("x shape:", x.shape, generation_config.max_length, generation_config.max_new_tokens)
 
-        # Setting the cache position for prefill. Would need to be changed if use dynamic cache for decoding.
-        if generation_config.use_cache:
-            if generation_config.cache_type == "prefill":
-                past_key_values = PrefillCache(self.config.num_hidden_layers)
-
-                cache_position = ~(x == mask_token_id)
-                cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
-            
-                prv_cache_position = None
-            elif generation_config.cache_type == 'decoded':
-                past_key_values = DynamicCache(self.config.num_hidden_layers)
-                cache_position = ~(x == mask_token_id)
-                cache_position = torch.cat([cache_position[:, 1:], cache_position[:, -1:]], dim=-1)
-                prv_cache_position = None
-            else:
-                raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
-        else:
-            past_key_values = None
-            cache_position = None
-            prv_cache_position = None
-       
         if attention_mask is not None and torch.any(attention_mask == 0.0):
-            print("attention_mask is not None ")
             # we do not mask the [MASK] tokens so value = 1.0
             attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
             tok_idx = attention_mask.long().cumsum(-1) - 1
             tok_idx.masked_fill_(attention_mask == 0, 1)
             # attention_mask is of shape [B, N]
             # broadcast to [B, 1, N, N]
-            ori_attention_mask = torch.logical_and(
+            attention_mask = torch.logical_and(
                 attention_mask.unsqueeze(1).unsqueeze(-2),
                 attention_mask.unsqueeze(1).unsqueeze(-1),
             )
         else:
-            print("attention_mask is None")
-            tok_idx = torch.arange(
-                max_length, device=input_ids.device
-            ).unsqueeze(0).repeat(input_ids.shape[0], 1)
-            #attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = None
             attention_mask = "full"
-            ori_attention_mask = "full"
-            #print("In Full:", attention_mask)
 
         timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
-        
-        total_tokens, run_tokens = 0, 0
         for i in range(steps):
             mask_index = (x == mask_token_id)
-
-            if not generation_config.use_cache:
-                cache_position, prv_cache_position = None, None    
-            else:
-                if generation_config.cache_type == "prefill":
-                    pass
-                elif generation_config.cache_type == "decoded":
-                    if i % generation_config.cache_steps == 0:
-                        prv_cache_position = None
-                        past_key_values.refresh_cache()
-                else:
-                    raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
-                
-            total_tokens += (x.shape[1] * x.shape[0])
-            if generation_config.use_cache and prv_cache_position is not None:
-                step_x = x[~prv_cache_position].view(x.shape[0], -1)
-
-                # reorder attention mask
-                if attention_mask != "full":
-                    att_mask_reorder = torch.cat([
-                        attention_mask[~prv_cache_position].view(x.shape[0], -1),
-                        attention_mask[prv_cache_position].view(x.shape[0], -1),
-                    ], -1)
-                    cur_attention_mask = F.pad(att_mask_reorder, (0, max_length - att_mask_reorder.shape[1]), value=1.0)
             
-                    # attention_mask is of shape [B, N]
-                    # broadcast to [B, 1, N, N]
-                    cur_attention_mask = torch.logical_and(
-                        cur_attention_mask.unsqueeze(1).unsqueeze(-2),
-                        cur_attention_mask.unsqueeze(1).unsqueeze(-1),
-                    )
-                else:
-                    cur_attention_mask = "full"
-            else:
-                step_x = x
-                cur_attention_mask = ori_attention_mask
-            run_tokens += (step_x.shape[1] * step_x.shape[0])
+            # torch.cuda.synchronize()
+            # start_event.record()
             
-            # print("prv cache position:", prv_cache_position)
+            
+            logits = self(x, attention_mask, tok_idx).logits
+            
+            # end_event.record()
+            # torch.cuda.synchronize()
+            # elapsed_ms = start_event.elapsed_time(end_event)
 
-            logits = self(
-                input_ids=step_x, 
-                attention_mask=cur_attention_mask,
-                position_ids=tok_idx,
-                use_cache=generation_config.use_cache,
-                cache_position=cache_position,
-                prv_cache_position=prv_cache_position,
-                past_key_values=past_key_values
-            ).logits
-
-            if logits.shape[1] < L:
-                
-                all_logits = torch.full((B, L, logits.shape[2]), -torch.inf, device=self.device, dtype=logits.dtype)
-                #print(all_logits.shape, (~prv_cache_position).shape, (~prv_cache_position).unsqueeze(-1).expand_as(all_logits).shape )
-                if B > 1:
-                    index = (~prv_cache_position).nonzero(as_tuple=True)[1].view(B, -1, 1).expand(B, -1, logits.shape[2])
-                    all_logits.scatter_(1, index,logits)
-                else:
-                    all_logits[~prv_cache_position] = logits
-                logits = all_logits
-
+            # total_time_ms += elapsed_ms
+            # count += 1
+            
+            
+            torch.cuda.synchronize()
+            sample_start_event.record()
+            
+            
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
             # this allows user-defined logits control of the intermediate steps
             logits = generation_logits_hook_func(i, x, logits)
-            
-            
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
 
-            torch.cuda.synchronize()  # sync before timing to avoid async carryover
-            start_event.record()
-            
             mask_logits = logits[mask_index]
-            
-            end_event.record()
-            torch.cuda.synchronize()  # wait for the event to be recorded
-
-            elapsed_time_ms = start_event.elapsed_time(end_event)
-            print(f"Time taken for mask_logits = logits[mask_index]: {elapsed_time_ms:.4f} ms") 
-            
-            
             t = timesteps[i]
             s = timesteps[i + 1]
-
+        
             if alg == 'origin':
                 p_transfer = 1 - s / t if i < steps - 1 else 1
                 x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
@@ -558,8 +465,8 @@ class DreamGenerationMixin:
                     if alg_temp is None or alg_temp == 0:
                         _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
                     else:
-                        confidence = confidence / alg_temp
-                        confidence = F.softmax(confidence, dim=-1)
+                        full_confidence = full_confidence / alg_temp
+                        full_confidence = F.softmax(full_confidence, dim=-1)
                         transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
                     x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                     x_[mask_index] = x0.clone()
@@ -569,38 +476,22 @@ class DreamGenerationMixin:
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
 
-            #print(f"Step {i}:", x)
             if histories is not None:
                 histories.append(x.clone())
-
-            if generation_config.use_cache:
-
-                if generation_config.cache_type == "prefill":
-                    #print("In prefill")
-                    if prv_cache_position is None:
-                        prv_cache_position = cache_position
-                        cache_position = None  
-                elif generation_config.cache_type == "decoded":
-                    prv_cache_position = cache_position
-                    #print(generation_config.cache_type, generation_config.shift_type, generation_config.cache_steps)
-                    if generation_config.shift_type == "un":
-                        cache_position = (x != mask_token_id)
-                        cache_position = torch.cat([cache_position[:, 1:], cache_position[:, :1]], dim=-1)
-                    elif generation_config.shift_type == "un_right":
-                        cache_position = (x[:, :-1] != mask_token_id) & (x[:, 1:] != mask_token_id)
-                        cache_position = torch.cat([cache_position, cache_position[:, -1:]], dim=-1)
-                    elif generation_config.shift_type == "right":
-                        cache_position = (x != mask_token_id)
-                    else:
-                        raise NotImplementedError
-                else:
-                    raise NotImplementedError(f"Unknown cache type: {generation_config.cache_type}")
-
+                
+            sample_end_event.record()
+            torch.cuda.synchronize()
+            elapsed_ms = sample_start_event.elapsed_time(sample_end_event)
+            
+            sample_total_time_ms += elapsed_ms
+            sample_count += 1
+                
+        print(f"Average time over {sample_count} runs: {sample_total_time_ms} ms")
+        
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
-                cache_ratio= run_tokens / total_tokens,
             )
         else:
             return x

@@ -11,18 +11,57 @@ from models.modeling_llada_cache_conv import LLaDAModelLM
 import time
 
 
-def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
+import re
+_NUMBER_RE = re.compile(r'\d[\d,]*(\.\d+)?')  
+def id_is_numeric(tok_id, tokenizer) -> bool:
+    """
+    Return True if `tok_id` corresponds to something that looks like
+    a number token – e.g. '7', '123', '3.14', '75,000', etc.
+    """
+    tok = tokenizer.convert_ids_to_tokens(int(tok_id), skip_special_tokens=True)
+
+    # Many tokenizers put a leading space before regular words,
+    # so strip it off first:
+    tok = tok.lstrip()
+    if bool(re.fullmatch(r'\d[\d,]*(\.\d+)?', tok)):
+        print(f"Token {tok} is numeric.")
+    # Accept integers, decimals, or comma-separated thousands
+    return bool(re.fullmatch(r'\d[\d,]*(\.\d+)?', tok))
+
+
+# given a sequence, return the idx of number tokens: Only work with batch size = 1 for now., 
+def get_number_token_indices(seq: torch.Tensor, tokenizer, start_idx=0) -> torch.Tensor:
+    # Convert only the tail we’re interested in (faster):
+    tail_ids = seq[start_idx:].tolist()
+    tail_toks = tokenizer.convert_ids_to_tokens(tail_ids, skip_special_tokens=True)
+
+    numeric_pos = [
+        i + start_idx
+        for i, tok in enumerate(tail_toks)
+        if _NUMBER_RE.fullmatch(tok.lstrip())
+    ]
+    
+    # for i, tok in enumerate(tail_toks):
+    #     if _NUMBER_RE.fullmatch(tok.lstrip()):
+    #         print(f"Token {tok} at position {i + start_idx} is numeric.")
+
+    return torch.tensor(numeric_pos, dtype=torch.long, device=seq.device)
+
+
+def block_starts(x: torch.tensor, n_parallel:int, start: int = 0, num_blocks: int = 1, block_id: int = 0):
     B = x.shape[0]
     L = x.shape[1]
     
-    # storing the index of the start of each block in a tensor.
-    starts = torch.empty((B, num_blocks), dtype=torch.long, device=x.device)
+    block_len = (L - start) // n_parallel
     
-    remaining = L - start
-    base, rem = divmod(remaining, num_blocks)
+    # storing the index of the start of each block in a tensor.
+    starts = torch.empty((B, n_parallel), dtype=torch.long, device=x.device)
+    
+    # remaining = L - start
+    base, rem = divmod(block_len, n_parallel)
 
     sizes = torch.tensor(
-        [base+1] * rem + [base] * (num_blocks - rem),
+        [base+1] * rem + [base] * (n_parallel - rem),
         device=x.device, dtype=torch.long, 
     )
         
@@ -34,7 +73,9 @@ def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
     starts = starts_row.expand(B, -1).clone()
     starts += start
     
-    # print("Block starts, ", block_starts)
+    starts = starts + block_id * block_len
+    
+    print("Block starts, ", block_starts)
     return starts
         
         
@@ -203,7 +244,9 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
     
     print("Prompt length: ", prompt.shape[1], " Gen length: ", gen_length)
     
-    decode_idx = block_starts(x, 2, L)
+    # decode_idx = block_starts(x, 2, L)
+    
+    future_cache = None
     
     for num_block in range(num_blocks):
         past_qkv = None
@@ -217,9 +260,12 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         
         future_cache_idx = None
         
+        decode_idx = block_starts(x, 2, num_blocks=num_blocks, block_id=num_block) # (B, 2)
+        
         spec_index_to_verify = None
         
         for i in range(steps):
+            print("Step: ", i, " decode idx: ", decode_idx)
             mask_index = (x == mask_id)
             if cur_transfer_index is not None:
             # still_masked = (input_ids == 126336) # [Mask] id
@@ -234,6 +280,41 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 logits, un_logits = torch.chunk(logits, 2, dim=0)
                 logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
             else:
+                
+                if i % 32 == 0:
+                    print ("Number Correction Step....")
+                    numerical_tokens_idx = get_number_token_indices(x[0], tokenizer, L)
+                    print("Number tokens idx: ", numerical_tokens_idx.shape)
+                    if numerical_tokens_idx.shape[0] > 0:
+                        math_correction_iter_count = numerical_tokens_idx.shape[0]
+                        # mask the sequence where there are numbers:
+                        
+                        for b in range(B):
+                            x[b, numerical_tokens_idx] = mask_id
+                            
+                        for j in range(math_correction_iter_count):
+                            math_decode_idx = numerical_tokens_idx[j]
+                            print("Decode idx: ", math_decode_idx, " math correction decode step: ", j, " token id: ", x[0, math_decode_idx])
+                            
+                            outputs = model(
+                                x, past_query_key_values = None, 
+                                use_cache = False, preprocess_cache = False,
+                                # future_cache_idx = future_cache_idx,
+                            )
+                            
+                            logits = outputs.logits
+                            
+                            logits_with_noise = add_gumbel_noise(logits, temperature=temperature) # b, l, D
+                            x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+                            
+                            print("Change from x to x0: ", x[0, math_decode_idx], " -> ", x0[0, math_decode_idx])
+                            x[b, math_decode_idx] = x0[b, math_decode_idx]
+                        continue
+                    else:
+                        continue
+
+                    
+                    
                 # print("Decode idx: ", decode_idx," decode step: ", i)
                 cache_reuse_mask = block_far_mask(decode_idx, x.shape[1], radius=32)       
                 # cache_reuse_mask = torch.zeros_like(x, dtype=torch.bool, device=x.device)
@@ -331,15 +412,16 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             # x0 = torch.where(mask_index, x0, x)
             confidence = torch.where(mask_index, x0_p, -np.inf)
             
-            if spec_index_to_verify is not None:
-                x0_spec_verify = x0[spec_index_to_verify]
-                confidence_spec_verify = x0_p[spec_index_to_verify]
-                # print("x0 spec verify: ", x0_spec_verify, " x0 spec verify shape: ", x0_spec_verify.shape)
-                print("Step: ", i-1 , "confidence spec verify: ", confidence_spec_verify, " confidence spec verify shape: ", confidence_spec_verify.shape)
-                bad_token_idx = confidence_spec_verify < threshod
+            # if spec_index_to_verify is not None:
+            #     x0_spec_verify = x0[spec_index_to_verify]
+            #     confidence_spec_verify = x0_p[spec_index_to_verify]
+            #     # print("x0 spec verify: ", x0_spec_verify, " x0 spec verify shape: ", x0_spec_verify.shape)
+            #     print("Step: ", i-1 , "confidence spec verify: ", confidence_spec_verify, " confidence spec verify shape: ", confidence_spec_verify.shape)
+            #     bad_token_idx = confidence_spec_verify < threshod
 
-                print("Step: ", i, " bad token idx: ", bad_token_idx)
-                # print("Low confidence mask: ", low_conf_mask)
+            #     print("Step: ", i, " bad token idx: ", bad_token_idx)
+            #     # print("Low confidence mask: ", low_conf_mask)
+                
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             select_index = decode_idx.clone().to(x0.device)
@@ -353,7 +435,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 else:
                     _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                 transfer_index[j, select_index] = True
-                print("Step: ", i , "select idx confidence: ", confidence[j, select_index], " decode idx: ", decode_idx[j])
+                # print("Step: ", i , "select idx confidence: ", confidence[j, select_index], " decode idx: ", decode_idx[j])
             
             decode_idx = decode_idx + 1
             
@@ -365,7 +447,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             if fix_remove:
                 all_transfer_index = all_transfer_index & (~special_index)
                 
-            spec_index_to_verify = transfer_index.clone()
+            # spec_index_to_verify = transfer_index.clone()
 
             # TODO: check if prv-transfer-idx and cur-transfer-idx work at the final order of the sequence
             # So prv_transfer_idx stores a snapshot of which tokens were already generated before this step, 
@@ -413,10 +495,10 @@ def main():
     decoding_start_time = time.time()
     out = generate(
         model, tokenizer, input_ids, 
-        steps=32, gen_length=128, block_length=128, 
+        steps=128, gen_length=256, block_length=128, 
         temperature=0., cfg_scale=0., 
         remasking='convolution',
-        enable_cache=False,
+        enable_cache=True,
         cache_reloading_step=4
     )
     print("Total Decoding Time = ", time.time() - decoding_start_time)

@@ -10,8 +10,9 @@ from models.modeling_llada_cache_conv import LLaDAModelLM
 
 import time
 
-N_PARALLEL=1
-
+N_PARALLEL=2
+THRESHOILD=0.5
+CORRECTION_INTERVAL = 4
 
 def block_starts(x: torch.tensor, num_blocks:int, start: int = 0):
     B = x.shape[0]
@@ -184,6 +185,9 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
     # get the intial form, which is a batch of [MASK] tokens, except for the prompt. Which is cloned. 
     x = torch.full((B, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
+    
+    
+    correction_candidate = torch.zeros_like(x, dtype=torch.int, device=x.device)
 
     prompt_index = (x != mask_id)
 
@@ -199,9 +203,14 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
     assert steps % num_blocks == 0
     steps = steps // num_blocks
     
-    print("Number of blocks: ", num_blocks, " Steps per block: ", steps)
+    prompt_length = prompt.shape[1]
+    
+    # steps = steps + (steps//CORRECTION_INTERVAL)
+    
+    print("Number of blocks: ", num_blocks, " Steps per block: ", steps, " mask token id: ", mask_id)
     
     print("Prompt length: ", prompt.shape[1], " Gen length: ", gen_length)
+    
     
     decode_idx = block_starts(x, N_PARALLEL, L)
     
@@ -220,7 +229,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
         for i in range(steps):
             mask_index = (x == mask_id)
             
-            # print(f"step {i} decode idx: ", decode_idx)
+            print(f"step {i} decode idx: ", decode_idx)
             if cur_transfer_index is not None:
             # still_masked = (input_ids == 126336) # [Mask] id
                 far_enough = torch.cumsum(~cur_transfer_index, dim=1) > 32
@@ -238,7 +247,7 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
                 cache_reuse_mask = block_far_mask(decode_idx, x.shape[1], radius=32)       
                 # cache_reuse_mask = torch.zeros_like(x, dtype=torch.bool, device=x.device)
                 # if not refreshing the cache, reuse the cache. 
-                if i % cache_reloading_step != 0 and i > 1 and enable_cache:
+                if i % cache_reloading_step != 0 and i > 1 and enable_cache and i % CORRECTION_INTERVAL != 0:
                     # set to reuse both query and kv cache. (essential for reordered Rope, if not set, use the original whole seq pos emb.)
                     if hasattr(model, "module"):
                         model.module.set_qkv_cache(True, True)
@@ -295,10 +304,39 @@ def generate(model, tokenizer, prompt, steps=128, gen_length=128, block_length=1
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
             
             
-            # # a cache reloading step:
-            # if i % cache_reloading_step == 0 and i > 1 and enable_cache:
-            #     unmasked_tokens = x0 != mask_id
+            # # # a cache reloading step:
+            # mask_index = (x == mask_id)
+            # if i % CORRECTION_INTERVAL == 0 and i > 1 and enable_cache:
+            #     print("step: ", i, " Correcting mistakes, x shape: ", x.shape)
+            #     x0_verify = x0[~mask_index]
+            #     p = F.softmax(logits.to(torch.float64), dim=-1) # B L V
+            #     x0_p_verify = torch.squeeze(
+            #         torch.gather(p, dim=-1, index=torch.unsqueeze(x, -1)), -1) # b, l, the probability of the predicted tokens.
+            #     print("x0_verify shape: ", x0_verify.shape, " x0_p_verify shape: ", x0_p_verify.shape)
+            #     x0_p_verify = x0_p_verify[~mask_index][prompt_length:] # remove the prompt length, since we are only interested in the generated tokens.
+            #     print("x0_p_verify shape without prompt and mask: ", x0_p_verify.shape)
+            #     fail_mask = x0_p_verify < THRESHOILD
+            #     fail_indices = torch.nonzero(fail_mask, as_tuple=True)[0]
+            #     non_mask_positions = torch.nonzero(~mask_index[0], as_tuple=True)[0]
+            #     generated_positions = non_mask_positions[prompt_length:]
+            #     real_fail_indices = generated_positions[fail_indices]
+            #     # print("fail_indices: ", fail_indices)
+            #     # fail_idx = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            #     # for j in range(x.shape[0]):
+            #     #     fail_idx[j, fail_indices] = True
                 
+            #     for idx in real_fail_indices:
+            #         # print("Correcting idx: ", idx, " x shape: ", x.shape, " x0 shape: ", x0.shape)
+            #         if x[0][idx] != x0[0, idx]:
+            #             # if correction_candidate[0, idx] == x0[0, idx]:
+            #             print(f"step{i}, correcting token: ",  idx, ", token id ", x[0][idx], " with new token: ", x0[0, idx])
+            #             print(f"changing from {tokenizer.decode(x[0][idx])} to {tokenizer.decode(x0[0, idx])}")
+            #             x[0][idx] = x0[0, idx]
+            #                 # correction_candidate[0, idx] = 0
+            #             # else:
+            #             #     correction_candidate[0, idx] = x0[0, idx]
+                
+                    
 
             if remasking == 'low_confidence':
                 p = F.softmax(logits.to(torch.float64), dim=-1) # B L V
@@ -380,7 +418,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
     prompt = [
-        "John plans to sell some of his toys and use the money to buy video games. He has 13 lego sets and he sells them for $15 each. He ends up buying 8 video games for $20 each and has $5 left. How many lego sets does he still have after selling and buying?",
+        "Four children are playing together—Akbar, Alessandro, Helene, and Wilfred. Helene is twice as old as the average age of the group, and the total age of the children is 20. If Akbar is 3 years old and Alessandro is 4 years old, calculate the age of Wilfred.",
     ] 
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
@@ -401,10 +439,10 @@ def main():
     decoding_start_time = time.time()
     out = generate(
         model, tokenizer, input_ids, 
-        steps=256, gen_length=256, block_length=256, 
+        steps=130, gen_length=256, block_length=256, 
         temperature=0., cfg_scale=0., 
         remasking='convolution',
-        enable_cache=False,
+        enable_cache=True,
         cache_reloading_step=4
     )
     print("Total Decoding Time = ", time.time() - decoding_start_time)
